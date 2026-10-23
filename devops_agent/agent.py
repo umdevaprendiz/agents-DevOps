@@ -15,7 +15,7 @@ from .audit import AuditLog
 from .config import Config
 from .i18n import t
 from .redaction import redact
-from .tools import TOOL_SCHEMAS, TOOLS_BY_NAME, Tool
+from .tools import Tool, Toolbox, build_toolbox
 
 Approver = Callable[[Tool, dict], bool]
 Progress = Callable[[str], AbstractContextManager]
@@ -56,10 +56,10 @@ def _native_tool_calls(message) -> list[ToolCall]:
     return [(c.function.name, dict(c.function.arguments or {})) for c in message.tool_calls or []]
 
 
-def _text_tool_calls(content: str) -> list[ToolCall]:
+def _text_tool_calls(content: str, known: dict) -> list[ToolCall]:
     """Small models sometimes write the call as JSON in the text instead of using tool_calls.
     E.g.: {"name": "inspect_container", "parameters": {"container": "api"}}"""
-    return [call for obj in _json_objects(content) if (call := _as_tool_call(obj))]
+    return [call for obj in _json_objects(content) if (call := _as_tool_call(obj, known))]
 
 
 def _json_objects(text: str) -> Iterator[dict]:
@@ -77,9 +77,9 @@ def _json_objects(text: str) -> Iterator[dict]:
         start = text.find("{", end)
 
 
-def _as_tool_call(obj: dict) -> ToolCall | None:
+def _as_tool_call(obj: dict, known: dict) -> ToolCall | None:
     args = obj.get("parameters") or obj.get("arguments") or {}
-    if obj.get("name") in TOOLS_BY_NAME and isinstance(args, dict):
+    if obj.get("name") in known and isinstance(args, dict):
         return obj["name"], args
     return None
 
@@ -101,12 +101,14 @@ class Agent:
         audit: AuditLog,
         label: str | None = None,
         progress: Progress | None = None,
+        tools: Toolbox | None = None,
     ):
         self.cfg = cfg
         self.console = console
         self.approver = approver
         self.audit = audit
         self.label = label
+        self.tools = tools or build_toolbox()
         self.client = ollama.Client(host=cfg.ollama_host)
         self._progress = progress or _no_progress
         self._send_think = True
@@ -157,7 +159,7 @@ class Agent:
         calls = _native_tool_calls(message)
         if calls and content:
             self._print(f"[italic dim]{escape(content)}[/]")
-        calls = calls or _text_tool_calls(content)
+        calls = calls or _text_tool_calls(content, self.tools.by_name)
         if not calls:
             return content
         self._run_calls(calls)
@@ -197,7 +199,7 @@ class Agent:
             "options": {"temperature": TEMPERATURE, "num_ctx": self.cfg.num_ctx},
         }
         if with_tools:
-            kwargs["tools"] = TOOL_SCHEMAS
+            kwargs["tools"] = self.tools.schemas
         if self._send_think:
             kwargs["think"] = False  # models like qwen3 answer much faster without "thinking" mode
         return kwargs
@@ -220,7 +222,7 @@ class Agent:
     # --- Running tools ---
 
     def _execute(self, name: str, args: dict) -> str:
-        tool = TOOLS_BY_NAME.get(name)
+        tool = self.tools.get(name)
         if tool is None:
             return self._unknown_tool(name)
         self._show_call(name, args)
@@ -230,7 +232,7 @@ class Agent:
 
     def _unknown_tool(self, name: str) -> str:
         self._print(f"[red]{escape(t('agent.unknown_tool', name=name))}[/]")
-        return t("prompt.unknown_tool", name=name, available=", ".join(TOOLS_BY_NAME))
+        return t("prompt.unknown_tool", name=name, available=", ".join(self.tools.names()))
 
     def _approve(self, tool: Tool, args: dict) -> bool:
         approved = self.approver(tool, args)

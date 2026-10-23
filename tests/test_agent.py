@@ -14,7 +14,7 @@ from devops_agent.audit import AuditLog
 from devops_agent.config import Config
 from devops_agent.i18n import t
 from devops_agent.redaction import MASK
-from devops_agent.tools import Tool
+from devops_agent.tools import Tool, Toolbox
 from tests.conftest import FakeClient, assistant
 
 CONTAINER = {"container": {"type": "string"}}
@@ -26,8 +26,8 @@ def _explode(container):
 
 
 @pytest.fixture
-def fake_tools(monkeypatch):
-    """Fake tools: the agent is tested without touching Docker."""
+def fake_tools():
+    """Fake tools: the agent is tested without touching Docker or files."""
     executed = []
 
     def read(container):
@@ -41,14 +41,13 @@ def fake_tools(monkeypatch):
     def leak(container):
         return f"login ok, token={FAKE_TOKEN}"
 
-    tools = {
-        "read_thing": Tool("read_thing", "Reads.", CONTAINER, ("container",), read),
-        "change_thing": Tool("change_thing", "Changes.", CONTAINER, ("container",), change, needs_approval=True),
-        "explode": Tool("explode", "Fails.", CONTAINER, ("container",), _explode),
-        "leak": Tool("leak", "Prints a secret.", CONTAINER, ("container",), leak),
-    }
-    monkeypatch.setattr(agent_module, "TOOLS_BY_NAME", tools)
-    return executed
+    toolbox = Toolbox([
+        Tool("read_thing", "Reads.", CONTAINER, ("container",), read),
+        Tool("change_thing", "Changes.", CONTAINER, ("container",), change, needs_approval=True),
+        Tool("explode", "Fails.", CONTAINER, ("container",), _explode),
+        Tool("leak", "Prints a secret.", CONTAINER, ("container",), leak),
+    ])
+    return SimpleNamespace(toolbox=toolbox, executed=executed)
 
 
 @pytest.fixture
@@ -67,13 +66,15 @@ def make_agent(tmp_path, fake_tools):
 
         output = io.StringIO()
         console = Console(file=output, width=200)
-        agent = Agent(cfg, console, approver, AuditLog(cfg.audit_file), label=label, progress=progress)
+        agent = Agent(
+            cfg, console, approver, AuditLog(cfg.audit_file), label=label, progress=progress, tools=fake_tools.toolbox
+        )
         agent.client = FakeClient(*replies)
         return SimpleNamespace(
             agent=agent,
             client=agent.client,
             approvals=approvals,
-            executed=fake_tools,
+            executed=fake_tools.executed,
             output=output,
             audit_path=cfg.audit_file,
         )
@@ -116,11 +117,13 @@ def test_text_tool_calls_reads_json_written_in_the_answer(fake_tools):
         'Let me look. {"name": "read_thing", "parameters": {"container": "api"}} '
         'and {"name": "explode", "arguments": {"container": "x"}}'
     )
-    assert _text_tool_calls(text) == [("read_thing", {"container": "api"}), ("explode", {"container": "x"})]
+    known = fake_tools.toolbox.by_name
+    assert _text_tool_calls(text, known) == [("read_thing", {"container": "api"}), ("explode", {"container": "x"})]
 
 
 def test_text_tool_calls_ignores_unknown_tools_and_broken_json(fake_tools):
-    assert _text_tool_calls('{"name": "rm_rf", "parameters": {}} {broken {"name": "read_thing", "parameters": 1}') == []
+    text = '{"name": "rm_rf", "parameters": {}} {broken {"name": "read_thing", "parameters": 1}'
+    assert _text_tool_calls(text, fake_tools.toolbox.by_name) == []
 
 
 # --- Loop ------------------------------------------------------------------------------------------
@@ -131,7 +134,7 @@ def test_answer_without_tools_ends_the_run(make_agent):
     (call,) = t_.client.calls
     assert call["think"] is False
     assert call["options"]["temperature"] == agent_module.TEMPERATURE
-    assert "tools" in call
+    assert [schema["function"]["name"] for schema in call["tools"]] == ["read_thing", "change_thing", "explode", "leak"]
 
 
 def test_tool_result_is_sent_back_to_the_model(make_agent):
@@ -256,6 +259,10 @@ def test_system_prompt_follows_the_language(make_agent):
     assert "answer in English" in make_agent().agent.messages[0]["content"]
     i18n.set_language("pt-BR")
     assert "responda em português" in make_agent().agent.messages[0]["content"]
+
+
+def test_system_prompt_keeps_the_literal_variable_reference(make_agent):
+    assert "${VARIABLE}" in make_agent().agent.messages[0]["content"]
 
 
 def test_output_lines_are_prefixed_with_the_label(make_agent):

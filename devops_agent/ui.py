@@ -10,6 +10,8 @@ from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm, InvalidResponse
+from rich.syntax import Syntax
+from rich.table import Table
 
 from .i18n import t
 from .tools import Tool
@@ -49,14 +51,19 @@ class YesNoConfirm(Confirm):
         raise InvalidResponse(self.validate_error_message)
 
 
+def confirm(question: str) -> bool:
+    """Yes/no question. Enter, Ctrl+C or no terminal means no."""
+    try:
+        return YesNoConfirm.ask(question, default=False, console=console)
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 def ask_approval(tool: Tool, args: dict) -> bool:
-    """Asks the operator whether the action may run. Enter, Ctrl+C or no terminal means no."""
+    """Asks the operator whether the action may run."""
     with _APPROVAL_LOCK:
         _show_approval_request(tool, args)
-        try:
-            return YesNoConfirm.ask(t("ui.allow"), default=False, console=console)
-        except (EOFError, KeyboardInterrupt):
-            return False
+        return confirm(t("ui.allow"))
 
 
 def _show_approval_request(tool: Tool, args: dict) -> None:
@@ -74,6 +81,22 @@ def show_answer(answer: str, label: str | None = None) -> None:
 def _hard_line_breaks(text: str) -> str:
     """In Markdown a single line break becomes a space; '  \\n' keeps the break the model meant."""
     return text.replace("\n", "  \n")
+
+
+def show_diff(title: str, diff: str) -> None:
+    if not diff.strip():
+        show_dim(t("ui.empty_diff"))
+        return
+    console.print(Panel(Syntax(diff, "diff", theme="ansi_dark", word_wrap=True), title=escape(title), border_style="cyan"))
+
+
+def show_table(title: str, columns: list[str], rows: list[tuple]) -> None:
+    table = Table(title=title, title_justify="left")
+    for column in columns:
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(escape(str(cell)) for cell in row))
+    console.print(table)
 
 
 def spinner(message: str) -> AbstractContextManager:

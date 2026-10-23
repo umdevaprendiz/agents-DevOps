@@ -18,6 +18,8 @@ Please include the affected version or commit, steps to reproduce and the impact
 | Secrets in container logs | Tool outputs and audit records go through `devops_agent/redaction.py` before reaching the model, the terminal or the disk. |
 | Secrets in the container config | `docker inspect` is summarized with environment variable **names only**, never values. |
 | Secrets in the repository | `.env` is git-ignored, `.env.example` holds only variable names, gitleaks runs on every commit (pre-commit) and on every push (CI). |
+| The model reading project secrets | File access is confined to `AGENT_WORKSPACE`; `.env*` (except `.env.example`), private keys, `.netrc`, `.npmrc`, `.pypirc` and `.git/` are never read, listed, searched or diffed. |
+| The model writing secrets or changing code without consent | Changes are only *proposed*, as commits on separate `agent/...` branches. New text that looks like a secret is refused. Only `/apply` (after confirmation) merges, `/undo` reverts, and `/pr` (after confirmation) is the only way anything is pushed. |
 
 ## Your responsibilities as an operator
 
@@ -48,6 +50,8 @@ Inclua a versão ou commit afetado, os passos para reproduzir e o impacto espera
 | Segredos nos logs dos containers | Saídas de ferramentas e registros de auditoria passam por `devops_agent/redaction.py` antes de chegar ao modelo, ao terminal ou ao disco. |
 | Segredos na configuração do container | O `docker inspect` é resumido apenas com os **nomes** das variáveis de ambiente, nunca os valores. |
 | Segredos no repositório | `.env` está no `.gitignore`, o `.env.example` tem só os nomes das variáveis e o gitleaks roda em todo commit (pre-commit) e em todo push (CI). |
+| O modelo ler segredos do projeto | O acesso a arquivos fica restrito ao `AGENT_WORKSPACE`; `.env*` (exceto `.env.example`), chaves privadas, `.netrc`, `.npmrc`, `.pypirc` e `.git/` nunca são lidos, listados, buscados ou incluídos em diffs. |
+| O modelo escrever segredos ou mudar o código sem permissão | As mudanças são só *propostas*, como commits em branches separadas `agent/...`. Texto novo que pareça segredo é recusado. Só o `/apply` (após confirmação) faz o merge, o `/undo` reverte, e só o `/pr` (após confirmação) envia algo para fora. |
 
 ## Responsabilidades de quem opera
 

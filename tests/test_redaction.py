@@ -71,6 +71,19 @@ def test_normal_lines_are_untouched(line):
     assert redact(line) == line
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "DB_PASSWORD=${DB_PASSWORD}",
+        "password: $DB_PASSWORD",
+        '"api_key": "${API_KEY}"',
+        "postgres://app:${DB_PASS}@db:5432/main",
+    ],
+)
+def test_variable_references_are_not_secrets(line):
+    assert redact(line) == line
+
+
 def test_redaction_is_idempotent():
     text = f"DB_PASSWORD={PASSWORD} token={GITHUB_TOKEN} postgres://u:{PASSWORD}@h/db"
     assert redact(redact(text)) == redact(text)

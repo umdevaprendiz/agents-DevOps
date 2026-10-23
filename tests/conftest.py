@@ -1,7 +1,10 @@
 """Shared fixtures. Unit tests need neither Docker nor Ollama running."""
 from __future__ import annotations
 
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +13,49 @@ from ollama import Message
 from devops_agent import i18n
 
 NOW = datetime.now(timezone.utc)
+
+COMPOSE = (
+    "services:\n"
+    "  web:\n"
+    "    image: nginx:alpine\n"
+    "    healthcheck:\n"
+    '      test: ["CMD", "wget", "-q", "http://localhost:8081/"]\n'
+)
+GIT_TEST_CONFIG = {
+    "user.name": "Test Operator",
+    "user.email": "operator@example.com",
+    "core.autocrlf": "false",
+    "commit.gpgsign": "false",
+}
+
+
+def write(root: Path, relative: str, text: str) -> Path:
+    """Writes a file with exact bytes (no newline translation on Windows)."""
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8"))
+    return path
+
+
+def git(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def git_repo(tmp_path) -> Path:
+    """A small git repository with one commit (skipped when git is not installed)."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    repo = tmp_path / "project"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    for key, value in GIT_TEST_CONFIG.items():
+        git(repo, "config", key, value)
+    write(repo, "docker-compose.yml", COMPOSE)
+    write(repo, "app/config.yml", "port: 3000\nlog_level: info\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "initial")
+    return repo
 
 
 @pytest.fixture(autouse=True)

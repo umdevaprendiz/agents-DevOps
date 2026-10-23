@@ -95,6 +95,20 @@ def test_watch_monitor_uses_interval_and_cooldown():
     assert (monitor.log_window, monitor.cooldown) == (15, 90)
 
 
+def test_debug_command_takes_an_optional_focus():
+    assert cli.build_parser().parse_args(["debug"]).focus == []
+    assert cli.build_parser().parse_args(["debug", "demo-api", "timeout"]).focus == ["demo-api", "timeout"]
+
+
+def test_debug_points_to_the_chat_when_fixes_were_proposed(monkeypatch):
+    calls, hints = [], []
+    monkeypatch.setattr(cli, "debug", lambda agent, store, focus: calls.append(focus) or True)
+    monkeypatch.setattr(cli, "show_dim", hints.append)
+    cli._run_debug("agent", "store", ["demo-api", "timeout"])
+    assert calls == ["demo-api timeout"]
+    assert "/diff" in hints[0]
+
+
 def test_language_argument_is_read_before_parsing():
     assert cli._language_argument(["--lang", "pt-BR", "check"]) == "pt-BR"
     assert cli._language_argument(["check"]) is None
@@ -156,7 +170,7 @@ def test_investigator_runs_one_agent_per_issue_with_evidence(monkeypatch):
     created = []
 
     class RecordingAgent(FakeAgent):
-        def __init__(self, cfg, console, approver, audit, label=None, progress=None):
+        def __init__(self, cfg, console, approver, audit, label=None, progress=None, tools=None):
             super().__init__()
             self.label = label
             created.append(self)
@@ -177,19 +191,27 @@ def test_investigator_runs_one_agent_per_issue_with_evidence(monkeypatch):
     assert sorted(results) == [("api", "answer 1"), ("web", "answer 1")]
 
 
-# --- Chat ---------------------------------------------------------------------------------------------
+# --- Workspace check -----------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("command", ["/clear", "/limpar"])
-def test_chat_turn_handles_reset_commands(output, command):
-    agent = FakeAgent()
-    cli._chat_turn(agent, command)
-    assert agent.resets == 1 and agent.runs == []
+def test_workspace_check_fails_for_a_missing_folder(output, tmp_path):
+    cfg = Config()
+    cfg.workspace = tmp_path / "missing"
+    assert cli._check_workspace(cfg) is False
 
 
-def test_chat_turn_ignores_empty_input():
-    agent = FakeAgent()
-    cli._chat_turn(agent, "")
-    assert agent.runs == []
+def test_workspace_check_accepts_folders_without_git(output, tmp_path):
+    cfg = Config()
+    cfg.workspace = tmp_path
+    assert cli._check_workspace(cfg) is True
+
+
+def test_workspace_check_shows_the_branch(monkeypatch, git_repo):
+    shown = []
+    monkeypatch.setattr(cli, "show_ok", shown.append)
+    cfg = Config()
+    cfg.workspace = git_repo
+    assert cli._check_workspace(cfg) is True
+    assert "branch main" in shown[0]
 
 
 # --- Confirmation --------------------------------------------------------------------------------------

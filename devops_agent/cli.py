@@ -9,26 +9,28 @@ import ollama
 from rich.markup import escape
 
 from . import docker_tools as dk
+from . import git_tools as git
 from . import i18n
 from .agent import Agent
 from .audit import AuditLog
+from .commands import Session, ask_agent, debug, run_chat
 from .config import Config, load_env_file
 from .i18n import t
 from .monitor import Issue, Monitor
+from .proposals import ProposalStore
+from .tools import Toolbox, build_toolbox
 from .ui import ask_approval, console, show_answer, show_dim, show_error, show_ok, spinner
 from .workers import Investigator
+from .workspace import Workspace
 
-EXIT_COMMANDS = {"/exit", "/quit", "/sair", "exit", "quit", "sair"}
-RESET_COMMANDS = {"/clear", "/limpar"}
 CHECK_LOG_WINDOW = 300  # seconds of logs scanned by the check command
 
 
 # --- Startup checks ---------------------------------------------------------------------------------
 
 def preflight(cfg: Config) -> bool:
-    docker_ok = _check_docker()
-    ollama_ok = _check_ollama(cfg)
-    return docker_ok and ollama_ok
+    checks = (_check_docker(), _check_ollama(cfg), _check_workspace(cfg))
+    return all(checks)
 
 
 def _check_docker() -> bool:
@@ -52,49 +54,16 @@ def _check_ollama(cfg: Config) -> bool:
     return False
 
 
-# --- Single agent: chat and ask ----------------------------------------------------------------------
-
-def run_task(agent: Agent, task: str) -> None:
-    try:
-        show_answer(agent.run(task))
-    except ollama.ResponseError as error:
-        show_error(t("cli.ollama_error"), str(error))
-    except (ConnectionError, OSError) as error:
-        show_error(t("cli.ollama_unreachable"), str(error))
-
-
-def cmd_chat(agent: Agent) -> None:
-    console.print(t("cli.chat_intro"))
-    while True:
-        text = _read_input()
-        if text is None or text.lower() in EXIT_COMMANDS:
-            return
-        _chat_turn(agent, text)
-
-
-def _read_input() -> str | None:
-    """Reads one line; None when the operator quits (Ctrl+C / Ctrl+D)."""
-    try:
-        return console.input(f"[bold green]{t('cli.prompt')}[/] ").strip()
-    except (EOFError, KeyboardInterrupt):
-        return None
-
-
-def _chat_turn(agent: Agent, text: str) -> None:
-    if not text:
-        return
-    if text.lower() in RESET_COMMANDS:
-        agent.reset()
-        show_dim(t("cli.chat_reset"))
-        return
-    try:
-        run_task(agent, text)
-    except KeyboardInterrupt:
-        console.print(f"[yellow]{t('cli.interrupted')}[/]")
-
-
-def cmd_ask(agent: Agent, question: str) -> None:
-    run_task(agent, question)
+def _check_workspace(cfg: Config) -> bool:
+    root = cfg.workspace.resolve()
+    if not root.is_dir():
+        show_error(t("cli.workspace_missing"), str(root), t("cli.workspace_hint"))
+        return False
+    if git.is_repo(root):
+        show_ok(t("cli.workspace_ok", path=escape(str(root)), branch=escape(git.current_branch(root))))
+    else:
+        show_dim(t("cli.workspace_no_git", path=str(root)))
+    return True
 
 
 # --- Incidents: check and watch ------------------------------------------------------------------------
@@ -157,10 +126,10 @@ def _heartbeat(new: int, running: int, last: tuple[int, int] | None) -> tuple[in
     return snapshot
 
 
-def build_investigator(cfg: Config, audit: AuditLog) -> Investigator:
+def build_investigator(cfg: Config, audit: AuditLog, tools: Toolbox | None = None) -> Investigator:
     def investigate(issue: Issue) -> str:
         # One Agent per investigation: agents keep conversation state and are not thread-safe.
-        agent = Agent(cfg, console, ask_approval, audit, label=issue.container)
+        agent = Agent(cfg, console, ask_approval, audit, label=issue.container, tools=tools)
         return agent.run(issue.task(), require_evidence=True)
 
     return Investigator(investigate, cfg.workers, on_result=report_result, on_error=report_error)
@@ -176,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("chat", help=t("cli.help.chat"))
     sub.add_parser("ask", help=t("cli.help.ask")).add_argument("question", nargs="+")
+    sub.add_parser("debug", help=t("cli.help.debug")).add_argument("focus", nargs="*", help=t("cli.help.focus"))
     _add_monitor_options(sub.add_parser("check", help=t("cli.help.check")))
     _add_watch_options(sub.add_parser("watch", help=t("cli.help.watch")))
     return parser
@@ -222,15 +192,37 @@ def _build_monitor(args: argparse.Namespace) -> Monitor:
     return Monitor(only=only, scan_logs=args.scan_logs, log_window=args.interval, cooldown=args.cooldown)
 
 
+def build_tools(cfg: Config) -> tuple[Toolbox, ProposalStore]:
+    workspace = Workspace(cfg.workspace)
+    proposals = ProposalStore(workspace)
+    return build_toolbox(workspace, proposals), proposals
+
+
 def _dispatch(args: argparse.Namespace, cfg: Config, audit: AuditLog) -> None:
+    tools, proposals = build_tools(cfg)
+    if args.command in ("check", "watch"):
+        _run_monitor(args, cfg, audit, tools)
+        return
+    agent = Agent(cfg, console, ask_approval, audit, progress=spinner, tools=tools)
     if args.command == "chat":
-        cmd_chat(Agent(cfg, console, ask_approval, audit, progress=spinner))
-    elif args.command == "ask":
-        cmd_ask(Agent(cfg, console, ask_approval, audit, progress=spinner), " ".join(args.question))
-    elif args.command == "check":
-        cmd_check(build_investigator(cfg, audit), _build_monitor(args))
+        run_chat(Session(agent, proposals, cfg))
+    elif args.command == "debug":
+        _run_debug(agent, proposals, args.focus)
     else:
-        cmd_watch(build_investigator(cfg, audit), _build_monitor(args), args.interval)
+        ask_agent(agent, " ".join(args.question))
+
+
+def _run_monitor(args: argparse.Namespace, cfg: Config, audit: AuditLog, tools: Toolbox) -> None:
+    investigator = build_investigator(cfg, audit, tools)
+    if args.command == "check":
+        cmd_check(investigator, _build_monitor(args))
+    else:
+        cmd_watch(investigator, _build_monitor(args), args.interval)
+
+
+def _run_debug(agent: Agent, proposals: ProposalStore, focus_words: list[str]) -> None:
+    if debug(agent, proposals, " ".join(focus_words)):
+        show_dim(t("cli.review_in_chat"))
 
 
 def main(argv: list[str] | None = None) -> int:

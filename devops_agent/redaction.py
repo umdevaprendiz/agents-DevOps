@@ -16,18 +16,31 @@ _SENSITIVE_KEY_RE = re.compile(rf"(?i)[\w.-]*(?:{_SENSITIVE_WORDS})[\w.-]*")
 Replacement = str | Callable[[re.Match[str]], str]
 
 
+def _is_reference(value: str) -> bool:
+    """${DB_PASSWORD} or $DB_PASSWORD points to a secret but is not one, so it stays visible."""
+    return value.strip("\"'").startswith("$")
+
+
 def _mask_assignment(match: re.Match[str]) -> str:
     """Keeps the key and the quotes, hides only the value: password="x" -> password="[REDACTED]"."""
     value = match.group(2)
+    if _is_reference(value):
+        return match.group(0)
     quote = value[0] if value[:1] in ("'", '"') else ""
     return f"{match.group(1)}{quote}{MASK}{quote}"
+
+
+def _mask_url_password(match: re.Match[str]) -> str:
+    if _is_reference(match.group(2)):
+        return match.group(0)
+    return f"{match.group(1)}{MASK}{match.group(3)}"
 
 
 _RULES: tuple[tuple[re.Pattern[str], Replacement], ...] = (
     # PEM private keys (also cut ones, without the END line)
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.DOTALL), MASK),
     # user:password@host inside URLs (postgres://, redis://, https://...)
-    (re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s@/]+(@)"), rf"\1{MASK}\2"),
+    (re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)([^\s@/]+)(@)"), _mask_url_password),
     # Authorization headers
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/-]{8,}=*"), rf"\1 {MASK}"),
     # Well-known token formats

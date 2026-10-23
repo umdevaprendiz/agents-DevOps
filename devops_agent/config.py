@@ -33,6 +33,8 @@ class Config:
     num_ctx: int = field(default_factory=lambda: _env_int("AGENT_NUM_CTX", 8192))
     max_tool_output: int = field(default_factory=lambda: _env_int("AGENT_MAX_TOOL_OUTPUT", 4000))
     audit_file: Path = field(default_factory=lambda: Path(_env("AGENT_AUDIT_FILE", "logs/audit.jsonl")))
+    # Project the agent reads and proposes changes to (a git repository).
+    workspace: Path = field(default_factory=lambda: Path(_env("AGENT_WORKSPACE", ".")))
 
 
 # --- .env file ------------------------------------------------------------------------------------
