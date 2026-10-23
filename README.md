@@ -1,17 +1,20 @@
 # DevOps Agent
 
-[![CI](https://github.com/umdevaprendiz/agents-DevOps/actions/workflows/ci.yml/badge.svg)](https://github.com/umdevaprendiz/agents-DevOps/actions/workflows/ci.yml)
-
 🇧🇷 [Leia em português](README.pt-BR.md)
 
-An autonomous DevOps agent that watches Docker containers, investigates failures with a **local LLM** (Ollama) and proposes or applies fixes **with human approval**.
+An autonomous DevOps agent that **debugs** your containers and your project with a **local LLM** (Ollama). It finds what is failing, explains each bug (the error, its cause and how to fix it) and **proposes the fix as a git branch** that you review and merge, or turn into a pull request.
 
-- **Private by default:** the model runs on your own Ollama, so logs never leave your network.
-- **Cheap detection:** problems are found by deterministic rules; the LLM is only called when something is wrong.
-- **Parallel:** detected incidents go into a queue consumed by N workers, and scanning never stops while investigations run.
-- **Safe:** there is no shell tool, arguments are validated, every state change needs human approval, and secrets are redacted before they reach the model or the disk.
-- **Auditable:** every task, tool call, approval and answer is a JSON line in `logs/audit.jsonl`.
-- **Bilingual:** English and Brazilian Portuguese, covering the agent's answers, the CLI and the docs.
+- **Debugs end to end:** containers, container logs, project log files, Dockerfiles, compose, CI, configuration and code.
+- **Explains like an engineer:** every problem comes as *Problem → Error → Cause → How to fix → Proposed change*.
+- **Fixes through git:** each fix is a commit on its own `agent/...` branch. Your files are untouched until you run `/apply`, or you run `/pr` to open a pull request.
+- **Private by default:** the model runs on your Ollama, so logs and code never leave your network.
+- **Safe:**
+  - there is no shell tool;
+  - file access is confined to the project, and secret files are never read;
+  - secrets are redacted before reaching the model;
+  - container actions need your approval.
+- **Parallel and auditable:** a queue of incidents is consumed by N workers, and every step is a JSON line in `logs/audit.jsonl`.
+- **Bilingual:** English and Brazilian Portuguese.
 
 > ⚠️ **No license yet.** The code is public to read, but until a license is added all rights are reserved.
 
@@ -20,32 +23,34 @@ An autonomous DevOps agent that watches Docker containers, investigates failures
 ## Contents
 
 1. [Quick start](#quick-start)
-2. [Architecture](#architecture)
-3. [Incident flow](#incident-flow)
-4. [Module reference](#module-reference)
-5. [Tools exposed to the model](#tools-exposed-to-the-model)
-6. [Monitor rules](#monitor-rules)
-7. [Agent loop](#agent-loop)
-8. [Parallel investigations](#parallel-investigations)
-9. [Security](#security)
-10. [Configuration](#configuration)
-11. [Languages](#languages)
-12. [Running in Docker](#running-in-docker)
-13. [Audit log](#audit-log)
-14. [Testing](#testing)
-15. [Demo environment](#demo-environment)
-16. [Extending](#extending)
-17. [Choosing a model](#choosing-a-model)
-18. [Code conventions](#code-conventions)
-19. [Known limitations](#known-limitations)
-20. [Roadmap](#roadmap)
-21. [Contributing](#contributing)
+2. [Debugging](#debugging)
+3. [Chat commands](#chat-commands)
+4. [Change proposals (git flow)](#change-proposals-git-flow)
+5. [Architecture](#architecture)
+6. [Module reference](#module-reference)
+7. [Tools exposed to the model](#tools-exposed-to-the-model)
+8. [Monitor rules](#monitor-rules)
+9. [Agent loop](#agent-loop)
+10. [Parallel investigations](#parallel-investigations)
+11. [Security](#security)
+12. [Configuration](#configuration)
+13. [Languages](#languages)
+14. [Running in Docker](#running-in-docker)
+15. [Audit log](#audit-log)
+16. [Testing](#testing)
+17. [Demo environment](#demo-environment)
+18. [Extending](#extending)
+19. [Choosing a model](#choosing-a-model)
+20. [Code conventions](#code-conventions)
+21. [Known limitations](#known-limitations)
+22. [Roadmap](#roadmap)
+23. [Contributing](#contributing)
 
 ---
 
 ## Quick start
 
-**Requirements:** Python 3.10+, Docker and [Ollama](https://ollama.com).
+**Requirements:** Python 3.10+, Docker, git and [Ollama](https://ollama.com).
 
 ```bash
 git clone https://github.com/umdevaprendiz/agents-DevOps.git
@@ -53,16 +58,94 @@ cd agents-DevOps
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e .
-
 ollama pull qwen3:4b
 cp .env.example .env               # optional: fill in only what you want to change
-
-devops-agent check                 # scan once and investigate whatever is broken
-devops-agent watch --scan-logs     # keep watching
-devops-agent chat                  # free conversation with the agent
 ```
 
-Runtime dependencies: [`ollama`](https://pypi.org/project/ollama/) (Python client) and [`rich`](https://pypi.org/project/rich/) (terminal output).
+Then point the agent at **your** project (any git repository) and debug it:
+
+```bash
+cd /path/to/your/project           # or set AGENT_WORKSPACE
+devops-agent debug                 # find what fails, explain it and propose fixes
+devops-agent debug api timeout     # same, focused on a container, file or symptom
+devops-agent chat                  # interactive: /debug, /diff, /explain, /apply, /pr...
+devops-agent watch --scan-logs     # keep watching containers and investigate incidents
+```
+
+---
+
+## Debugging
+
+`devops-agent debug [focus]`, or `/debug [focus]` in the chat, runs a full debugging session:
+
+1. **`collect_diagnostics`** gathers in one call, without the LLM:
+   - containers with problems and their latest error lines;
+   - error lines in the project's log files (`*.log`, including git-ignored ones);
+   - the project's infrastructure files (Dockerfiles, compose, CI, Kubernetes, Terraform, nginx...).
+2. **The model investigates each problem in depth:** container logs and `inspect`, plus the related project files (`read_file`, `search_files`, `git_diff`...).
+3. **It explains every problem** in a fixed format:
+
+   ```
+   **Problem:** demo-web-unhealthy is marked unhealthy
+   **Error:** wget: can't connect to remote host: Connection refused (healthcheck, 650 consecutive failures)
+   **Cause:** the healthcheck probes http://localhost:8081/ but nginx listens on port 80
+   **How to fix:** point the healthcheck to port 80 in docker-compose.yml, then run docker compose up -d web-unhealthy
+   **Proposed change:** 3f9c2e
+   ```
+
+4. **When a file change fixes the problem, it calls `propose_change`** with the smallest edit. Restarting will not fix a config bug, so the agent is told not to suggest it in those cases. When the fix is an action, such as starting a database or setting a variable on the host, it gives the exact command.
+
+Incidents found by `check`/`watch` follow the same path: diagnosis in that format, plus a proposed fix when a file change solves it.
+
+---
+
+## Chat commands
+
+`devops-agent chat` works like a coding assistant: you talk to the agent and use slash commands. Every command has an English name and a Portuguese alias.
+
+| Command | Alias | What it does |
+|---|---|---|
+| `/help` | `/ajuda` | Lists the commands |
+| `/debug [focus]` | `/depurar` | Finds what is failing (containers, logs, project), explains each bug and proposes fixes |
+| `/suggest [focus]` | `/sugerir` | Reviews the project and proposes **only necessary** changes (bugs, security risks, wrong config) |
+| `/proposals` | `/propostas` | Lists pending proposals |
+| `/diff [id]` | — | Shows the changes of a proposal (default: the latest) |
+| `/explain [id]` | `/explicar` | The agent explains a proposal: what changes, why, risks, how to test |
+| `/apply [id]` | `/aplicar` | Merges the proposal into your current branch (asks for confirmation) |
+| `/pr [id]` | — | Pushes the proposal branch and opens a pull request (asks for confirmation) |
+| `/discard [id]` | `/descartar` | Deletes a proposal |
+| `/undo` | `/desfazer` | Reverts the last applied proposal with a new commit |
+| `/status` | — | Model, language, workspace, branch and pending proposals |
+| `/clear` | `/limpar` | Clears the conversation |
+| `/exit` | `/sair`, `/quit` | Quits |
+
+Anything that does not start with `/` is a normal question to the agent ("why is the worker restarting?", "is the nginx config safe?").
+
+---
+
+## Change proposals (git flow)
+
+```mermaid
+flowchart LR
+    A["Agent<br/>propose_change"] -- "commit with plumbing,<br/>working tree untouched" --> B["branch agent/fix-...-3f9c2e"]
+    B -- "/diff, /explain" --> R{"You decide"}
+    R -- "/apply" --> M["merge --no-ff into<br/>your current branch"]
+    R -- "/pr" --> P["push + pull request<br/>(GitHub CLI if installed)"]
+    R -- "/discard" --> D["branch deleted"]
+    M -- "/undo" --> U["git revert (new commit)"]
+```
+
+- **Each proposal is one commit on its own branch** `agent/<title-slug>-<id>`, authored by `DevOps Agent <devops-agent@users.noreply.localhost>`, so it is easy to tell apart from human commits.
+- **Your working tree, index and current branch are never touched while proposing.** The commit is built with a temporary index (`read-tree` → `hash-object` → `update-index` → `write-tree` → `commit-tree`).
+- **Edits are exact replacements:** `old_text` must appear once in the file, and `old_text=''` creates a new file. The store also handles CRLF files and line numbers that the model copied by mistake (`12| `). It refuses:
+  - paths outside the workspace;
+  - secret files;
+  - lines containing `[REDACTED]`;
+  - new text that looks like a secret (the model must use `${VARIABLE}` references instead).
+- **`/apply`** runs `git merge --no-ff` with your own git identity and then deletes the proposal branch. If there is a conflict, the merge is aborted and your repository stays as it was.
+- **`/undo`** reverts the last applied proposal with `git revert -m 1`, so history is kept.
+- **`/pr`** asks for confirmation, then pushes the branch and runs `gh pr create` when the GitHub CLI is installed. Without it, the agent tells you which branch to open the PR from.
+- **The agent never commits to your branch and never pushes on its own.**
 
 ---
 
@@ -70,375 +153,188 @@ Runtime dependencies: [`ollama`](https://pypi.org/project/ollama/) (Python clien
 
 ```mermaid
 flowchart LR
-    CLI["cli.py"] --> Monitor["Monitor<br/>rules, no LLM"]
-    Monitor -- "Issue" --> Queue[["Investigator<br/>queue"]]
-    Queue --> W1["worker 1<br/>Agent"]
-    Queue --> WN["worker N<br/>Agent"]
-    W1 <--> Ollama[("Ollama")]
-    WN <--> Ollama
-    W1 --> Tools["tools.py"]
-    WN --> Tools
-    Tools --> DT["docker_tools.py"]
-    DT -- "docker CLI, no shell" --> Docker[("Docker daemon<br/>local or DOCKER_HOST")]
-    Tools -. "output" .-> Redact["redaction.py"]
-    W1 --> Audit["AuditLog<br/>logs/audit.jsonl"]
-    W1 -. "needs_approval" .-> UI["ui.ask_approval"]
+    CLI["cli.py / commands.py"] --> Monitor["Monitor<br/>rules, no LLM"]
+    CLI --> Agent["Agent"]
+    Monitor -- "Issue" --> Queue[["Investigator<br/>queue + N workers"]]
+    Queue --> Agent
+    Agent <--> Ollama[("Ollama")]
+    Agent --> Tools["Toolbox"]
+    Tools --> DT["docker_tools"]
+    Tools --> WS["workspace<br/>read-only, confined"]
+    Tools --> DG["diagnostics"]
+    Tools --> PR["proposals"]
+    PR --> Git[("git repository")]
+    DT -- "docker CLI, no shell" --> Docker[("Docker daemon")]
+    Tools -. "every output" .-> Redact["redaction"]
+    Agent --> Audit["AuditLog"]
 ```
-
-| Layer | Responsibility | Uses the LLM? |
-|---|---|---|
-| `Monitor` | Scans containers and applies rules that produce `Issue`s | No |
-| `Investigator` | Queue plus worker threads; one investigation per container at a time | No |
-| `Agent` | Investigates an `Issue` or a question, calling tools in a loop | Yes |
-| `Tool` / `docker_tools` | Runs Docker commands with fixed, validated arguments | No |
-| `redaction` | Hides secrets in tool outputs, log examples and audit records | No |
-| `ui` / `cli` / `i18n` | Terminal I/O, approvals and translations | No |
 
 ### Project layout
 
 ```
 devops_agent/
-  __main__.py      python -m devops_agent
-  cli.py           argument parsing, preflight, commands (chat, ask, check, watch)
-  ui.py            Rich console, YesNoConfirm, approval prompt, answer rendering
+  cli.py           argument parsing, preflight, commands (chat, ask, debug, check, watch)
+  commands.py      chat loop and slash commands; debug() and suggest() sessions
   agent.py         Agent: model → tool → result loop
-  workers.py       Investigator: queue + parallel worker threads
+  tools.py         Tool, Toolbox and every tool exposed to the model
+  docker_tools.py  Docker CLI wrapper
+  workspace.py     confined, read-only access to the project files
+  diagnostics.py   deterministic health report (containers, log files, infra files)
+  git_tools.py     git CLI wrapper, including plumbing commits
+  proposals.py     change proposals: create, diff, apply, pull request, discard, undo
   monitor.py       Issue, Monitor and detection rules
-  tools.py         Tool, the TOOLS catalog and the schemas sent to Ollama
-  docker_tools.py  Docker CLI wrapper (reads, inspect summary, actions)
+  workers.py       Investigator: queue + parallel worker threads
   redaction.py     secret masking
   audit.py         AuditLog (JSON Lines, thread-safe)
+  ui.py            Rich console, confirmations, diff and table rendering
   config.py        Config and .env loading
-  i18n.py          t(), language detection
-  locales/         en.py, pt_br.py (message catalogs)
-tests/             pytest suite (see "Testing")
+  i18n.py, locales/  translations (en, pt-BR)
+tests/             pytest suite
 demo/              containers broken on purpose
-Dockerfile         runtime image (non-root)
-.env.example       variable names only, no values
-SECURITY.md        security policy and how to report vulnerabilities
-```
-
-### Class diagram
-
-```mermaid
-classDiagram
-    class Config {
-        +str model
-        +str ollama_host
-        +str language
-        +int workers
-        +int max_steps
-        +int num_ctx
-        +int max_tool_output
-        +Path audit_file
-    }
-    class Agent {
-        +str label
-        +list messages
-        +reset()
-        +run(task, require_evidence) str
-        -_solve(task, require_evidence) str
-        -_step() str
-        -_execute(name, args) str
-        -_invoke(tool, args) str
-    }
-    class Investigator {
-        +int size
-        +submit(issue) bool
-        +busy() int
-        +wait()
-    }
-    class Tool {
-        +str name
-        +dict params
-        +bool needs_approval
-        +str keep
-        +schema() dict
-        +run(args) str
-    }
-    class Monitor {
-        +scan() list~Issue~
-        +due(issues) list~Issue~
-    }
-    class Issue {
-        +str container
-        +tuple problems
-        +detail() str
-        +task() str
-    }
-    class AuditLog {
-        +log(event, data)
-    }
-    class YesNoConfirm {
-        +process_response(value) bool
-    }
-    class DockerError
-
-    Exception <|-- DockerError
-    Confirm <|-- YesNoConfirm
-    Agent --> Config
-    Agent --> AuditLog
-    Agent ..> Tool : runs
-    Monitor ..> Issue : creates
-    Investigator ..> Issue : queues
-    Investigator ..> Agent : one per issue
-```
-
----
-
-## Incident flow
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant M as Monitor
-    participant I as Investigator
-    participant A as Agent (worker)
-    participant O as Ollama
-    participant T as Tool / Docker
-    participant H as Operator
-
-    M->>T: docker ps -a + one docker inspect
-    M->>M: rules → Issue("demo-api", "stopped with exit code 1")
-    M->>I: submit(issue)  (skipped if already queued or running)
-    I->>A: new Agent(label="demo-api").run(task, require_evidence=True)
-    loop up to max_steps
-        A->>O: chat(messages, tools, think=False)
-        O-->>A: tool_calls
-        A->>T: Tool.run(args)
-        T-->>A: output → redact → truncate
-    end
-    opt state-changing action
-        A->>H: "Allow restart_container on demo-api?" (y/N)
-        H-->>A: y or n
-    end
-    O-->>A: final answer (Diagnosis / Probable cause / Action)
-    A-->>I: answer
-    I-->>H: panel "Agent · demo-api"
 ```
 
 ---
 
 ## Module reference
 
-### `config.py`
-
-- **`Config`** (dataclass): settings read from the environment when it is created. Empty values count as unset, so the empty lines of `.env.example` are harmless.
-- `load_env_file(path=None)` loads `KEY=VALUE` lines into `os.environ` without overriding variables that are already set. The default location is `.env`, or `AGENT_ENV_FILE`. It understands comments, `export`, quotes and values containing `=`.
-
-### `docker_tools.py`
-
-Everything goes through `_run(args, timeout, merge_stderr)`, which calls `subprocess.run(["docker", *args])` (no shell) and raises **`DockerError`** on a non-zero exit, a missing CLI or a timeout.
-
-| Function | Role |
+| Module | Main pieces |
 |---|---|
-| `_name`, `_since` | Validate the container name (`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`) and the log window (`^\d+[smh]$`) |
-| `_as_bool`, `_clamp`, `_json_lines` | Normalize values coming from the model and `{{json .}}` output |
-| `parse_docker_time` | Parses Docker timestamps (nanoseconds, `Z`); returns `None` for `0001-01-01` |
-| `list_containers`, `inspect_container(s)`, `container_logs`, `container_stats` | Read-only commands |
-| `_summarize` → `_state/_health/_host/_config/_network_summary` | Reduce `docker inspect` to about 20 fields; env vars keep **names only** |
-| `restart/start/stop_container` → `_container_action` | Actions (120 s timeout) |
-
-Because the Docker CLI honors `DOCKER_HOST` and `DOCKER_CONTEXT`, the agent can watch a remote daemon.
-
-### `tools.py`
-
-**`Tool`** (frozen dataclass): `name`, `description`, `params`, `required`, `func`, `needs_approval` and `keep` (`"head"`/`"tail"`, the part kept when truncating). `run(args)` drops invented or empty arguments (`_known_args`), checks the required ones (`_check_required`) and serializes the result (`_to_text`).
-`_action_tool()` builds state-changing tools that always have `needs_approval=True`. The module exports `TOOLS`, `TOOLS_BY_NAME` and `TOOL_SCHEMAS`. Tool descriptions stay in English, which models follow most reliably.
-
-### `agent.py`
-
-**`Agent`**: one conversation with the model. It is not thread-safe, so the system creates one per investigation.
-
-| Method | Role |
-|---|---|
-| `run(task, require_evidence=False)` | Public API. Gives each run a `run_id`; on error or Ctrl+C it rolls the history back |
-| `reset()` | Resets the history to the system prompt of the current language |
-| `_solve` / `_step` / `_force_answer` | Main loop, one round, and the forced answer when `max_steps` is reached |
-| `_demand_evidence` | Rejects an answer given without any tool (only with `require_evidence`) |
-| `_ask_model` / `_chat_kwargs` / `_chat` | Ollama call; retries without `think` for models that don't support it |
-| `_execute` / `_approve` / `_invoke` | Tool lookup, approval, execution, **redaction** and truncation |
-| `_print` / `_audit` | Output prefixed with `[label]`; audit events carry `run` and `subject` |
-| `_trim_history` | Keeps the system prompt plus the last `HISTORY_TURNS` (3) turns |
-
-Module functions:
-- `_clean` removes `<think>` blocks, including reasoning that ends in a lone `</think>` (qwen3 does this).
-- `_native_tool_calls` reads structured tool calls.
-- `_text_tool_calls`, `_json_objects` and `_as_tool_call` handle models that write the call as JSON in plain text.
-
-### `workers.py`
-
-**`Investigator`**: a `queue.Queue` consumed by `size` daemon threads.
-- `submit(issue)` returns `False` when that container is already queued or under investigation.
-- `busy()` counts queued plus running investigations.
-- `wait()` polls until everything is done, so Ctrl+C still works on Windows.
-- A failure in one investigation is reported through `on_error` and never kills the worker.
-
-### `monitor.py`
-
-**`Issue`** (frozen dataclass) holds `container` and `problems`, plus `detail` and `task()` (translated). **`Monitor`** offers `scan()` (one `docker ps` plus one `docker inspect` for all containers) and `due(issues)` (cooldown per container). Rules live in small functions: `_state_problem`, `_health_problem`, `_restart_problem` and `_log_problem`. Log examples are redacted.
-
-### `redaction.py`
-
-`redact(text)` applies the masking rules. `redact_data(value)` walks dicts and lists and hides the whole value under keys that look sensitive (`DB_PASSWORD`, `api_key`, `token`...). The replacement is always `[REDACTED]`.
-
-### `audit.py`
-
-**`AuditLog`**: `log(event, **data)` writes one JSON line with `ts` (UTC) and `event`. It uses a lock (safe with parallel workers), omits `None` fields and redacts every record.
-
-### `i18n.py` and `locales/`
-
-`t(key, **values)` returns the text in the current language and falls back to English. `detect_language()` picks the language (see [Languages](#languages)). Catalogs are plain dicts in `locales/en.py` and `locales/pt_br.py`.
-
-### `ui.py` and `cli.py`
-
-- **`ui.py`:** `console`; **`YesNoConfirm`**, which shows `y/n` or `s/n` and accepts both; `ask_approval`, which is serialized by a lock so parallel workers take turns at the terminal; `show_answer(answer, label)`; `spinner` for chat.
-- **`cli.py`:** `main()` loads `.env`, applies `--lang`, builds the parser with translated help, runs the preflight (Docker plus the model in Ollama) and dispatches. It returns `1` when the preflight fails.
+| `workspace.py` | **`Workspace`**: `resolve` (refuses escapes and secret files), `list_files`, `read_file` (numbered lines), `search` (regex, falls back to plain text), `git_status`/`git_log`/`git_diff` (secret files excluded), `log_files` and `tail_lines` (huge logs). **`WorkspaceError`**. |
+| `diagnostics.py` | `collect(workspace)`: containers with problems plus their last error lines, project log files with errors, infrastructure files. |
+| `git_tools.py` | `_git` (argument list, no shell, `GIT_TERMINAL_PROMPT=0`, bytes so CRLF is preserved); `commit_files` (plumbing commit with the agent identity); `merge`/`revert_merge` (abort on conflict); `branches`, `read_blob`, `push`... **`GitError`**. |
+| `proposals.py` | **`ProposalStore`**: `create`, `pending`, `get`, `diff`, `apply`, `discard`, `undo_last`, `open_pull_request`. **`Proposal`**, **`Edit`**, `parse_edits` (accepts a list, a dict or a JSON string), `apply_edit`. **`ProposalError`**. |
+| `commands.py` | **`Session`**, **`Command`**, `COMMANDS`, `dispatch`, `handle_input`, `run_chat`, `debug`, `suggest`, `ask_agent`. |
+| `tools.py` | **`Tool`**, **`Toolbox`**, `DOCKER_TOOLS`, `workspace_tools`, `diagnostics_tool`, `proposal_tool`, `build_toolbox`. |
+| `agent.py` | **`Agent`**: `run(task, require_evidence)` plus small private steps (`_step`, `_execute`, `_approve`, `_invoke`...). It receives a `Toolbox`. |
+| `monitor.py`, `workers.py`, `redaction.py`, `audit.py`, `config.py`, `i18n.py`, `ui.py`, `docker_tools.py` | Unchanged responsibilities: rules, the parallel queue, masking, audit, settings, translations, terminal and the Docker CLI. |
 
 ---
 
 ## Tools exposed to the model
 
-| Tool | Docker command | Approval | Long output keeps |
-|---|---|---|---|
-| `list_containers(include_stopped?)` | `docker ps [-a] --format {{json .}}` | — | start |
-| `inspect_container(container)` | `docker inspect --type container` (summarized) | — | start |
-| `get_container_logs(container, tail?)` | `docker logs --tail N` (stdout+stderr, max 500 lines) | — | **end** |
-| `get_container_stats(container?)` | `docker stats --no-stream` | — | start |
-| `restart_container(container)` | `docker restart` | **yes** | — |
-| `start_container(container)` | `docker start` | **yes** | — |
-| `stop_container(container)` | `docker stop` | **yes** | — |
-
-Execution errors go back to the model as text (`"Error: ..."`) so it can correct itself, for example after a wrong container name.
+| Tool | What it does | Approval |
+|---|---|---|
+| `collect_diagnostics()` | Starting point: containers with problems, log file errors, infrastructure files | — |
+| `list_containers`, `inspect_container`, `get_container_logs`, `get_container_stats` | Docker reads (`inspect` shows env var **names only**) | — |
+| `list_files(pattern?)` | Project files (respects `.gitignore`; secret files hidden; up to 300) | — |
+| `read_file(path, start_line?, max_lines?)` | File with numbered lines (`12| `), up to 500 lines, 512 KB max, text only | — |
+| `search_files(pattern, glob?)` | Regex search across the project (`path:line: text`, up to 60 matches) | — |
+| `git_status`, `git_log(limit?)`, `git_diff(path?)` | Repository state and uncommitted changes (secret files excluded) | — |
+| `propose_change(title, explanation, edits)` | Commits a fix to a new `agent/...` branch; you decide later | — (you decide with `/apply` or `/pr`) |
+| `restart_container`, `start_container`, `stop_container` | Container actions | **yes** |
 
 ---
 
 ## Monitor rules
 
-Every rule that fires for a container is merged into a single `Issue`.
+Every rule that fires for a container is merged into one `Issue`.
 
 | Rule | Condition |
 |---|---|
 | Restart loop | `status == "restarting"` |
 | Dead | `status == "dead"` |
-| Failed exit | `status == "exited"` and (`exit_code != 0` or `oom_killed`) and finished ≤ 24 h ago |
-| Healthcheck | `status == "running"` and `health == "unhealthy"` |
+| Failed exit | `exited` and (`exit_code != 0` or `oom_killed`) and finished ≤ 24 h ago |
+| Healthcheck | `running` and `health == "unhealthy"` |
 | Restarted between scans | `running` and `restart_count` grew since the last scan |
 | Loop on first scan | `running`, no history, `restart_count ≥ 3` and started ≤ 5 min ago |
 | Log errors (`--scan-logs`) | `running` and ≥ 3 lines matching `ERROR_RE` inside the window |
 
-- Containers that exited with code 0 are ignored, because they are finished jobs.
-- Stopped containers keep their last health status, which is why the healthcheck rule only applies to `running` ones.
-- The log window is `--interval` for `watch` and 300 s for `check`.
-- The cooldown (default 600 s) avoids alerting about the same container on every scan.
+`ERROR_RE` recognizes:
+- upper-case levels (`ERROR`, `FATAL`, `CRITICAL`, `PANIC`);
+- `Error:` / `TypeError:` / `Fatal:`;
+- Go's `panic:`;
+- Python tracebacks;
+- `*Exception` names (`RuntimeException`, `NullPointerException`...);
+- structured `level=error` / `"level":"error"`.
 
 ---
 
 ## Agent loop
 
 1. **Start:** appends the task, trims old history and audits `task`.
-2. **Round:** calls `chat` with `tools`, `temperature=0.1`, `num_ctx` and `think=False`, then strips any reasoning from the answer.
-3. **Tool calls:** reads `message.tool_calls`. If there are none, it looks for a JSON call in the text and accepts only names that exist in `TOOLS_BY_NAME`.
+2. **Round:** calls `chat` with the toolbox, `temperature=0.1`, `num_ctx` and `think=False`, then strips any reasoning, including qwen3's reasoning that ends in a lone `</think>`.
+3. **Tool calls:** native `tool_calls`; if there are none, it looks for a JSON call written in the text and accepts only known tool names.
 4. **Execution:**
-   - An unknown tool returns an error that lists the valid ones.
-   - An action with `needs_approval` asks the operator first; if denied, it returns "Action DENIED".
-   - The output is redacted, truncated to `max_tool_output` characters and appended as `role="tool"`.
-5. **Evidence:** for incidents (`require_evidence=True`), an answer given without any tool is rejected once.
-6. **End:** an answer without tool calls is the final answer.
-7. **Limit:** after `max_steps` rounds, the agent sends one last call **without tools** that forces an answer.
+   - An unknown tool returns the list of valid ones.
+   - Container actions ask for approval.
+   - Every output is **redacted**, truncated and sent back as `role="tool"`.
+5. **Evidence:** for incidents, an answer given without using any tool is rejected once.
+6. **End:** the answer uses the *Problem / Error / Cause / How to fix / Proposed change* format for problems, and plain answers otherwise.
+7. **Limit:** after `max_steps` rounds, one last call without tools forces an answer.
 
 ---
 
 ## Parallel investigations
 
 `check` and `watch` hand every `Issue` to the `Investigator`:
+- N worker threads (`AGENT_WORKERS` / `--workers`, default 2) investigate different containers at once.
+- A container that is already queued or under investigation is not queued again.
+- Each investigation gets its own `Agent`, labeled with the container name: output lines look like `[api] → ...` and audit records carry the same `run` id.
+- Approvals are asked one at a time.
 
-- **N workers** (`AGENT_WORKERS` or `--workers`, default 2) investigate different containers at the same time.
-- **The scanner keeps running** during investigations, and a container already queued or under investigation is not queued again.
-- **One `Agent` per investigation**, labeled with the container name. Terminal lines look like `[demo-api] → inspect_container(...)` and every audit event carries the same `run` id.
-- **Terminal approvals are serialized:** only one prompt at a time.
-- **Ctrl+C exits immediately:** worker threads are daemons.
-
-> More workers only help if the LLM backend serves requests in parallel. With Ollama, set `OLLAMA_NUM_PARALLEL` and use a GPU; on a CPU-only machine, requests queue inside Ollama anyway.
+> More workers only help if the LLM backend serves requests in parallel (Ollama with `OLLAMA_NUM_PARALLEL` and a GPU). On a CPU-only machine, use `--workers 1`.
 
 ---
 
 ## Security
 
-The full policy and how to report vulnerabilities are in **[SECURITY.md](SECURITY.md)**. In short:
+Full policy in **[SECURITY.md](SECURITY.md)**.
 
 | Threat | Mitigation |
 |---|---|
-| The model running arbitrary commands | No shell tool; fixed argument lists (`shell=False`); validated container names |
-| The model breaking something | Every action requires approval; the default answer is **no**; Enter, Ctrl+C and EOF all mean no |
-| Prompt injection through logs ("stop all containers") | A small, typed tool set, and approval for every action |
-| Secrets in logs reaching the model or disk | `redaction.py` runs on every tool output, log example and audit record |
-| Secrets in container configuration | `inspect` shows environment variable **names only** |
-| Secrets in the repository | `.env` is git-ignored; `.env.example` has names only (enforced by a test); gitleaks runs in pre-commit and in CI |
-| Secrets in the image | `.dockerignore` excludes `.env*` and `logs/`; the container runs as non-root |
-
-**Redaction** recognizes:
-- PEM private keys and `user:password@host` in URLs;
-- `Bearer`/`Basic` authorization values;
-- AWS access key IDs and GitHub, GitLab, Slack, Google, OpenAI-style and Telegram tokens;
-- JWTs;
-- `password`/`secret`/`token`/`api_key`/`access_key`/`private_key`/`credential` assignments, in `key=value`, `key: value` and JSON forms.
-
-It is a safety net, not a guarantee.
+| The model running arbitrary commands | No shell tool; Docker and git always run with fixed argument lists; validated container names |
+| The model reading or leaking secrets | Workspace confined to its root; `.env*` (except `.env.example`), private keys, `.netrc`, `.npmrc`, `.pypirc`, `.git/` are never read, listed, searched or diffed; every tool output is redacted |
+| The model writing secrets into the repo | `propose_change` refuses new text that looks like a secret and lines containing `[REDACTED]`; the prompt asks for `${VARIABLE}` references |
+| The model changing your code without consent | Proposals live on separate branches; only `/apply` (with confirmation) merges, and `/undo` reverts |
+| Pushing without consent | Only `/pr`, after confirmation; git never waits for credential prompts |
+| The model breaking containers | Every container action needs approval; the default answer is **no** |
+| Prompt injection through logs or files | A small, typed tool set; nothing changes without your approval |
 
 ---
 
 ## Configuration
 
-Settings come from environment variables or from a `.env` file in the working directory. Copy `.env.example` (it holds **names only**) and fill in just what you need. Real variables always win over the file.
+Environment variables or a `.env` file (copy `.env.example`, which holds **names only**). Real variables win over the file.
 
 | Variable | Default | Description |
 |---|---|---|
+| `AGENT_WORKSPACE` | current directory | Project the agent debugs and proposes changes to (a git repository) |
 | `AGENT_MODEL` | `qwen3:4b` | Ollama model |
 | `AGENT_LANGUAGE` | system language | `en` or `pt-BR` |
 | `AGENT_WORKERS` | `2` | Parallel investigations |
 | `AGENT_MAX_STEPS` | `12` | Max model → tool rounds per task |
 | `AGENT_NUM_CTX` | `8192` | Context window requested from Ollama |
 | `AGENT_MAX_TOOL_OUTPUT` | `4000` | Max characters of each tool output |
-| `AGENT_AUDIT_FILE` | `logs/audit.jsonl` | Audit log path (relative to the working directory) |
+| `AGENT_AUDIT_FILE` | `logs/audit.jsonl` | Audit log path |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server |
-| `DOCKER_HOST` / `DOCKER_CONTEXT` | Docker defaults | Which daemon to watch |
-| `AGENT_ENV_FILE` | `.env` | Location of the env file (set it in the real environment) |
-
-### CLI
+| `DOCKER_HOST` / `DOCKER_CONTEXT` | Docker defaults | Which daemon to debug |
 
 ```
-devops-agent [--model MODEL] [--lang en|pt-BR] {chat,ask,check,watch} ...
+devops-agent [--model MODEL] [--lang en|pt-BR] {chat,ask,debug,check,watch} ...
 ```
 
 | Command | Options | Behavior |
 |---|---|---|
-| `chat` | — | Interactive REPL; `/clear` (or `/limpar`) resets it; `/exit` (or `/sair`) quits |
+| `chat` | — | Interactive session with slash commands |
 | `ask QUESTION...` | — | One question, one answer |
-| `check` | `--only a,b`, `--scan-logs`, `--workers N` | One scan; investigates every issue in parallel, waits and exits |
-| `watch` | the same, plus `--interval 30` and `--cooldown 600` | Continuous scanning; prints a status line only when something changes |
+| `debug [FOCUS...]` | — | Full debugging session; prints proposals to review in the chat |
+| `check` | `--only a,b`, `--scan-logs`, `--workers N` | One scan; investigates every incident in parallel |
+| `watch` | the same, plus `--interval 30` and `--cooldown 600` | Continuous scanning |
 
-`--model` and `--lang` go **before** the command. Before any command, the preflight checks `docker version` and `ollama show <model>`.
+The preflight checks Docker, the model in Ollama and the workspace. A folder without git still works, but change proposals are disabled.
 
 ---
 
 ## Languages
 
-The agent's answers, the system prompt, CLI messages, monitor messages and `--help` are translated. Tool descriptions stay in English on purpose.
-
-The language is chosen in this order:
+The model's answers, the CLI, the slash commands and `--help` are translated. The language is chosen in this order:
 1. `--lang`
 2. `AGENT_LANGUAGE`
 3. the OS locale
-4. the `LANG`/`LC_*` variables
+4. `LANG`/`LC_*`
 5. English
 
-The OS locale comes before `LANG` because tools like Git for Windows export `LANG=en_US` even on Portuguese systems.
-
-**To add a language:**
-1. Copy `devops_agent/locales/en.py` and translate the values, keeping every `{placeholder}`.
-2. Register the new catalog in `i18n.CATALOGS` and map its codes in `i18n.normalize`.
-3. Run `pytest tests/test_i18n.py`. It fails if keys or placeholders differ, if code uses a missing key, or if a key is never used.
+To add a language, copy `locales/en.py`, translate it and register it in `i18n.py`. `tests/test_i18n.py` guarantees the same keys and placeholders in every language, and that every key is used.
 
 ---
 
@@ -446,27 +342,24 @@ The OS locale comes before `LANG` because tools like Git for Windows export `LAN
 
 ```bash
 docker build -t devops-agent .
-
 docker run -it --rm \
   -v /var/run/docker.sock:/var/run/docker.sock \
   --group-add "$(stat -c '%g' /var/run/docker.sock)" \
   --add-host=host.docker.internal:host-gateway \
   -e OLLAMA_HOST=http://host.docker.internal:11434 \
-  -e AGENT_LANGUAGE=en \
-  -v devops-agent-data:/data \
-  devops-agent watch --scan-logs
+  -v "$PWD:/workspace" -e AGENT_WORKSPACE=/workspace \
+  devops-agent debug
 ```
 
-- `-it` is required because approvals are asked in the terminal.
-- The image runs as the non-root user `agent` (UID 10001). `--group-add` gives it access to the socket on Linux. On Docker Desktop, if you get *permission denied* on the socket, use `--group-add 0` (the socket belongs to `root` there).
-- ⚠️ Mounting the Docker socket is equivalent to root on the host. Prefer a remote `DOCKER_HOST` with TLS, or a socket proxy that only allows `ps`, `inspect`, `logs`, `stats`, `start`, `stop` and `restart`.
-- The audit log goes to the `/data` volume.
+- `-it` is needed for confirmations.
+- The image runs as the non-root user `agent` (UID 10001). On Docker Desktop, use `--group-add 0` if the socket gives *permission denied*.
+- ⚠️ Mounting the Docker socket is equivalent to root on the host. Prefer a remote `DOCKER_HOST` with TLS, or a socket proxy that allows only the endpoints the agent uses.
 
 ---
 
 ## Audit log
 
-JSON Lines format, one event per line. Every event has `ts`, `event`, `run` (a unique id for each task) and `subject` (the container being investigated, when there is one).
+JSON Lines. Every event has `ts`, `event`, `run` (one id per task) and `subject` (the container, when there is one).
 
 | `event` | Extra fields |
 |---|---|
@@ -474,12 +367,6 @@ JSON Lines format, one event per line. Every event has `ts`, `event`, `run` (a u
 | `tool` | `tool`, `args`, `ok`, `output` (first 500 characters, redacted) |
 | `approval` | `tool`, `args`, `approved` |
 | `answer` | `answer` |
-
-```json
-{"ts": "2026-10-23T19:31:02+00:00", "event": "task", "run": "3f9c2e1a", "subject": "demo-api", "task": "The monitor detected a problem in container 'demo-api'...", "model": "qwen3:4b"}
-{"ts": "2026-10-23T19:31:20+00:00", "event": "tool", "run": "3f9c2e1a", "subject": "demo-api", "tool": "get_container_logs", "args": {"container": "demo-api"}, "ok": true, "output": "Starting API on port 3000...\nERROR: could not connect to database..."}
-{"ts": "2026-10-23T19:31:41+00:00", "event": "approval", "run": "3f9c2e1a", "subject": "demo-api", "tool": "restart_container", "args": {"container": "demo-api"}, "approved": false}
-```
 
 ---
 
@@ -489,123 +376,77 @@ JSON Lines format, one event per line. Every event has `ts`, `event`, `run` (a u
 pip install -e ".[dev]"
 pytest                          # everything
 pytest -m "not integration"     # without touching Docker (what CI runs)
-pytest tests/test_redaction.py -v
 ```
 
-Unit tests need **neither Docker nor Ollama**: both are replaced by test doubles.
-
-| Double | Where | Replaces |
-|---|---|---|
-| `FakeClient`, `assistant()` | `tests/conftest.py` | `ollama.Client` and model messages (text, `tool_calls` or exceptions) |
-| `make_info()` | `tests/conftest.py` | The `docker_tools._summarize` dict, healthy by default |
-| `english` (autouse) | `tests/conftest.py` | Pins the language to English and resets it after each test |
-| `fake_tools` | `tests/test_agent.py` | `TOOLS_BY_NAME`: a read tool, an action, a failing tool and a tool that leaks a secret |
-| `docker_calls` | `tests/test_docker_tools.py` | `docker_tools._run`: records the command without running it |
-| `fake_docker` | `tests/test_monitor.py` | `list_containers` / `inspect_containers` |
-| `FakeInvestigator`, `FakeAgent` | `tests/test_cli.py` | The queue and the agent, for testing commands |
+Unit tests need **neither Docker nor Ollama**: they use test doubles (`FakeClient`, `assistant()`, `make_info()`, `fake_tools`, `docker_calls`, `fake_docker`). Git tests use real temporary repositories (fixture `git_repo`).
 
 | File | Covers |
 |---|---|
-| `test_agent.py` | Loop, JSON-in-text fallback, approvals, errors, step limit, evidence, `think` fallback, reasoning without an opening tag, history rollback, redaction, labels, `run` id |
-| `test_workers.py` | Real parallelism (a barrier only passes if two run at once), no duplicates per container, failure isolation |
-| `test_redaction.py` | Every secret format, normal lines left untouched, idempotency, nested data |
-| `test_config.py` | `.env` parsing, real environment wins, empty values, **`.env.example` holds names only** |
-| `test_i18n.py` | Same keys and placeholders in every language, no missing or unused keys, language detection |
-| `test_monitor.py` | Every rule, `ERROR_RE`, `--only`, restart memory, cooldown, redacted log examples |
-| `test_docker_tools.py` | Injection rejected, inspect summary (env values never exposed), subprocess errors, built commands |
-| `test_tools.py` | `Tool.run`, schema, **only actions need approval** |
-| `test_cli.py` | Arguments, `--lang`, preflight, `check`/`watch` with the queue, heartbeat, chat, `YesNoConfirm` |
-| `test_audit.py` | Format, redaction, 8 threads writing at the same time |
-| `test_docker_integration.py` | Read-only checks against the real daemon (marked `integration`) |
+| `test_agent.py` | Loop, tool calls written as JSON text, approvals, errors, step limit, evidence, `think` fallback, reasoning cleanup, redaction, labels, audit |
+| `test_workspace.py` | Confinement (`../`, absolute paths), secret files, `.gitignore`, numbered reading, size and binary limits, search, `git_diff` without secrets |
+| `test_git_tools.py` | Plumbing commits that never touch the working tree, agent identity, executable bit, CRLF, merge/revert, conflicts aborted |
+| `test_proposals.py` | Exact edits (unique, ambiguous, CRLF, line numbers), secret guards, subfolder workspaces, apply/undo/discard, push to a remote, **end to end: the model proposes and the operator applies** |
+| `test_diagnostics.py` | Containers with errors, Docker down, git-ignored log files, huge logs, infrastructure files |
+| `test_commands.py` | Every command and alias, `/debug`, `/suggest`, `/diff`, `/explain` (no secrets sent), confirmations for `/apply`, `/pr`, `/discard`, `/undo` |
+| `test_cli.py`, `test_workers.py`, `test_monitor.py`, `test_docker_tools.py`, `test_tools.py`, `test_redaction.py`, `test_config.py`, `test_i18n.py`, `test_audit.py` | CLI, parallel queue, rules and `ERROR_RE`, Docker wrapper, toolbox, masking (including `${VAR}` references), `.env`, translations, audit |
 
-**CI** (`.github/workflows/ci.yml`) runs on every push and pull request:
-- unit tests on Python 3.10, 3.11, 3.12 and 3.13;
-- gitleaks over the whole git history;
-- a Docker image build with a smoke test.
+CI runs:
+- the unit tests on Python 3.10 to 3.13;
+- gitleaks over the whole history;
+- a Docker image build.
 
 ---
 
 ## Demo environment
 
-`demo/docker-compose.yml` starts four containers with known defects:
+`demo/docker-compose.yml` starts four containers with known defects. Run `devops-agent debug` inside this repository to watch the agent explain them and propose fixes.
 
-| Container | Defect | Rule | Expected conclusion |
-|---|---|---|---|
-| `demo-web` | none | — | (no alert) |
-| `demo-web-unhealthy` | healthcheck probes port 8081, nginx listens on 80 | Healthcheck | The healthcheck is wrong, not nginx |
-| `demo-api` | Postgres does not exist | Failed exit (1) | Restarting won't help; the database is missing |
-| `demo-worker` | `QUEUE_URL` missing, `restart: always` | Restart loop (2) | Set the environment variable |
-
-```bash
-docker compose -f demo/docker-compose.yml up -d
-devops-agent check
-docker compose -f demo/docker-compose.yml down
-```
+| Container | Defect | Expected diagnosis |
+|---|---|---|
+| `demo-web` | none | (no alert) |
+| `demo-web-unhealthy` | healthcheck probes 8081, nginx listens on 80 | Wrong healthcheck port → proposal editing `docker-compose.yml` |
+| `demo-api` | Postgres does not exist | Restarting won't help; the database is missing |
+| `demo-worker` | `QUEUE_URL` missing, `restart: always` | Set the environment variable |
 
 ---
 
 ## Extending
 
-**A read-only tool:** add a function to `docker_tools.py`, then register it in `TOOLS`:
-
-```python
-def disk_usage() -> list[dict]:
-    return _json_lines(_run(["system", "df", "--format", "{{json .}}"]))
-```
-
-```python
-Tool(
-    name="get_disk_usage",
-    description="Docker disk usage: images, containers, volumes and build cache.",
-    params={},
-    required=(),
-    func=dk.disk_usage,
-),
-```
-
-**An action** must always go through `_action_tool`, which enforces approval:
-
-```python
-_action_tool("pause_container", "Pauses a container.", dk.pause_container),
-```
-
-**A detection rule:** write a `_my_rule(info) -> str | None` function in `monitor.py` (or a method, if it depends on monitor settings), add its text to both catalogs and append it to the `found` tuple in `Monitor._check`.
-
-**Another approval channel** (Slack, Telegram, webhook): `Agent` receives an `Approver = Callable[[Tool, dict], bool]`, so it is enough to implement one, keeping "no answer means no".
+- **A tool:** add a `Tool` in `tools.py`. Read-only tools need no approval. Container actions use `_action_tool`, which enforces approval. File changes must go through `propose_change`.
+- **A chat command:** add a `Command(name, aliases, usage, help_key, handler)` to `commands.COMMANDS` and its texts to both catalogs.
+- **A detection rule:** add a small function to `monitor.py` and include it in `Monitor._check`.
+- **An approval channel:** `Agent` receives an `Approver = Callable[[Tool, dict], bool]`.
 
 ---
 
 ## Choosing a model
 
-Results on the demo environment, on a CPU-only machine:
+| Model | `demo-web-unhealthy` on a CPU-only machine |
+|---|---|
+| `llama3.2:3b` | ❌ Invented an OOM kill; once it fabricated a whole `docker inspect` output |
+| `qwen3:4b` (default) | ✅ Found the wrong healthcheck port and that restarting won't help; slow on a CPU |
 
-| Model | `demo-web-unhealthy` | Notes |
-|---|---|---|
-| `llama3.2:3b` | ❌ Invented an "OOMKilled"; in another run it fabricated a whole `docker inspect` output | Fast, but unreliable with tools (which led to `require_evidence`) |
-| `qwen3:4b` (default) | ✅ Found that the healthcheck probes port 8081 while nginx listens on 80, and that restarting won't help | Much better reasoning; it reasons even with `think=False`, and `_clean` strips that reasoning |
-
-On a CPU, expect minutes per investigation. With a GPU, larger models (such as `qwen3:8b` and up) and more workers pay off.
+Code changes need more context and reasoning than diagnosis. With a GPU, a larger model (such as `qwen3:8b` and up) gives much better proposals.
 
 ---
 
 ## Code conventions
 
-- **English code:** classes, functions, variables and comments. Texts for operators and for the model go through `t()` and live in `locales/`.
-- **Small, single-purpose functions** (about 5 lines on average). Long functions are split into well-named helpers (`_solve → _start / _step / _force_answer`).
-- **The `_` prefix** marks anything internal to a module, and **constants** are `UPPER_CASE` at the top of the module.
-- **Expected errors become values** when the model has to react to them (tool errors, denied actions).
-- **Few dependencies:** Docker through its CLI instead of an SDK, `argparse` and `.env` parsing without extra libraries.
+- **English code**, with every text going through `t()` in `locales/`.
+- **Small, single-purpose functions** and `UPPER_CASE` constants.
+- **Expected errors become values** for the model (tool errors, refused edits).
+- **No shell, ever:** subprocesses always receive argument lists.
+- **Few dependencies:** `ollama` and `rich`.
 
 ---
 
 ## Known limitations
 
-- **Speed on a CPU:** an investigation can take minutes.
-- **Hallucinations:** small models still invent details, which is why actions need approval and incidents need evidence.
-- **Terminal approvals:** they wait indefinitely, so an unattended `watch` that needs an approval keeps that investigation on hold. Chat or webhook approvals with a timeout are on the roadmap.
-- **In-memory state:** the queue, cooldown and restart counters live in one process and are lost on restart.
-- **History is trimmed by turns, not tokens:** a few turns with large logs can still exceed `num_ctx`.
-- **Log errors:** `ERROR_RE` misses `Error:` written in title case (common in Node.js) and compound exception names such as `RuntimeException`.
+- **Speed on a CPU:** a debugging session can take several minutes.
+- **Hallucinations:** small models still invent details. Proposals and actions always wait for you.
+- **Exact-replacement edits:** big refactors are out of scope by design ("only necessary changes").
+- **Terminal confirmations:** there are no timeouts or remote approval channels yet.
+- **In-memory state:** the queue, cooldown and restart counters live in one process.
 - **Redaction is regex-based:** custom secret formats may get through.
 - **Docker only:** there is no Kubernetes support yet.
 
@@ -613,22 +454,20 @@ On a CPU, expect minutes per investigation. With a GPU, larger models (such as `
 
 ## Roadmap
 
-- [x] Test suite (pytest) and CI
-- [x] Public-repository security: redaction, `.env` with names only, gitleaks, `SECURITY.md`
+- [x] Test suite and CI
+- [x] Public-repository security (redaction, `.env` names only, gitleaks)
 - [x] English and Brazilian Portuguese
-- [x] Installable package (`devops-agent`) and Docker image
-- [x] Parallel investigations (queue + workers)
-- [ ] Wider `ERROR_RE` (`Error:`, `*Exception`)
-- [ ] Config file and per-tool policies (allow / approve / deny)
+- [x] Installable package and Docker image
+- [x] Parallel investigations
+- [x] Debugging sessions (`debug`, `/debug`, `collect_diagnostics`)
+- [x] Slash commands and change proposals on git branches (`/diff`, `/explain`, `/apply`, `/pr`, `/undo`)
+- [ ] Permission modes (only suggest / ask / automatic) and per-tool policies
+- [ ] Approval channels with timeouts (webhook, Slack, Telegram)
 - [ ] LLM providers: any OpenAI-compatible API (vLLM, LM Studio...)
-- [ ] Persistent state (SQLite, then Postgres) and a distributed queue (Redis) for multiple instances
-- [ ] Approval channels with timeouts: webhook, Slack, Telegram
-- [ ] Multiple Docker hosts
-- [ ] Kubernetes
-- [ ] `/health`, Prometheus metrics and an HTTP API
-- [ ] Plugins (tools, rules, channels)
-- [ ] Incident memory with embeddings
-- [ ] More Docker tools: compose, disk usage, image cleanup
+- [ ] Security scanning of logs (brute force, suspicious access) and of configs (exposed ports, root containers, `latest` tags)
+- [ ] Persistent state and a distributed queue
+- [ ] Multiple Docker hosts, then Kubernetes
+- [ ] `/health`, Prometheus metrics, HTTP API
 
 ---
 
@@ -636,11 +475,11 @@ On a CPU, expect minutes per investigation. With a GPU, larger models (such as `
 
 ```bash
 pip install -e ".[dev]"
-pre-commit install          # scans every commit for secrets (gitleaks)
+pre-commit install          # gitleaks on every commit
 pytest
 ```
 
 - Keep functions small and code in English.
 - Put every new text in **both** catalogs.
-- Never commit real values: use `.env`, which is git-ignored.
+- Never commit real values.
 - Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
