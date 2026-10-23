@@ -1,7 +1,8 @@
-"""Acesso ao Docker pela CLI.
+"""Docker access through the CLI.
 
-Tudo roda com lista de argumentos (sem shell) e os nomes de container são
-validados, então o modelo não consegue injetar comandos arbitrários.
+Commands always run as an argument list (never through a shell) and container names
+are validated, so the model cannot inject arbitrary commands. DOCKER_HOST and
+DOCKER_CONTEXT are honored, which lets the agent watch a remote daemon.
 """
 from __future__ import annotations
 
@@ -10,7 +11,10 @@ import re
 import subprocess
 from datetime import datetime
 
+from .i18n import t
+
 MAX_LOG_LINES = 500
+DEFAULT_TIMEOUT = 30
 ACTION_TIMEOUT = 120
 STATS_TIMEOUT = 45
 
@@ -21,12 +25,12 @@ _FALSE_WORDS = {"false", "0", "no", "nao", "não", ""}
 
 
 class DockerError(Exception):
-    """Falha ao executar um comando docker."""
+    """Any failure running a docker command."""
 
 
-# --- execução ---------------------------------------------------------------
+# --- Execution ------------------------------------------------------------------------------------
 
-def _run(args: list[str], timeout: int = 30, merge_stderr: bool = False) -> str:
+def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT, merge_stderr: bool = False) -> str:
     proc = _invoke(args, timeout, merge_stderr)
     if proc.returncode != 0:
         raise DockerError(_error_message(proc, args))
@@ -44,29 +48,29 @@ def _invoke(args: list[str], timeout: int, merge_stderr: bool) -> subprocess.Com
             errors="replace",
             timeout=timeout,
         )
-    except FileNotFoundError as e:
-        raise DockerError("Docker CLI não encontrado no PATH.") from e
-    except subprocess.TimeoutExpired as e:
-        raise DockerError(f"'docker {args[0]}' excedeu {timeout}s.") from e
+    except FileNotFoundError as error:
+        raise DockerError(t("docker.cli_missing")) from error
+    except subprocess.TimeoutExpired as error:
+        raise DockerError(t("docker.timeout", command=args[0], seconds=timeout)) from error
 
 
 def _error_message(proc: subprocess.CompletedProcess, args: list[str]) -> str:
-    # Com merge_stderr o erro vem no stdout (stderr fica None).
+    # With merge_stderr the error arrives on stdout (stderr is None).
     output = proc.stderr if proc.stderr is not None else proc.stdout
-    return (output or "").strip() or f"'docker {args[0]}' saiu com código {proc.returncode}"
+    return (output or "").strip() or t("docker.exit_code", command=args[0], code=proc.returncode)
 
 
-# --- validação e conversão ----------------------------------------------------
+# --- Validation and conversion ----------------------------------------------------------------------
 
 def _name(value) -> str:
     if not isinstance(value, str) or not _NAME_RE.match(value):
-        raise DockerError(f"nome de container inválido: {value!r}")
+        raise DockerError(t("docker.invalid_name", value=repr(value)))
     return value
 
 
 def _since(value: str) -> str:
     if not _SINCE_RE.match(value):
-        raise DockerError(f"valor inválido para since: {value!r}")
+        raise DockerError(t("docker.invalid_since", value=repr(value)))
     return value
 
 
@@ -85,7 +89,7 @@ def _json_lines(text: str) -> list[dict]:
 
 
 def parse_docker_time(value: str | None) -> datetime | None:
-    """Converte '2026-10-23T19:20:01.123456789Z' em datetime (o Docker usa nanossegundos)."""
+    """Parses '2026-10-23T19:20:01.123456789Z' (Docker uses nanoseconds)."""
     if not value or value.startswith("0001-"):
         return None
     match = _TIME_RE.match(value)
@@ -103,7 +107,7 @@ def _utc_offset(offset: str) -> str:
     return "+00:00" if offset == "Z" else offset
 
 
-# --- leitura -----------------------------------------------------------------
+# --- Read-only commands -------------------------------------------------------------------------------
 
 def server_version() -> str:
     return _run(["version", "--format", "{{.Server.Version}}"]).strip()
@@ -111,7 +115,7 @@ def server_version() -> str:
 
 def list_containers(include_stopped=True) -> list[dict]:
     args = ["ps", "-a"] if _as_bool(include_stopped) else ["ps"]
-    return [_container_row(r) for r in _json_lines(_run([*args, "--format", "{{json .}}"]))]
+    return [_container_row(row) for row in _json_lines(_run([*args, "--format", "{{json .}}"]))]
 
 
 def _container_row(row: dict) -> dict:
@@ -133,14 +137,14 @@ def container_logs(container: str, tail=80, since: str | None = None) -> str:
     args = ["logs", "--tail", str(_clamp(tail, 1, MAX_LOG_LINES))]
     if since:
         args += ["--since", _since(since)]
-    return _run([*args, _name(container)], merge_stderr=True).strip() or "(sem logs)"
+    return _run([*args, _name(container)], merge_stderr=True).strip() or t("docker.no_logs")
 
 
 def container_stats(container: str | None = None) -> list[dict]:
     args = ["stats", "--no-stream", "--format", "{{json .}}"]
     if container:
         args.append(_name(container))
-    return [_stats_row(r) for r in _json_lines(_run(args, timeout=STATS_TIMEOUT))]
+    return [_stats_row(row) for row in _json_lines(_run(args, timeout=STATS_TIMEOUT))]
 
 
 def _stats_row(row: dict) -> dict:
@@ -155,10 +159,10 @@ def _stats_row(row: dict) -> dict:
     }
 
 
-# --- resumo do docker inspect -------------------------------------------------
+# --- docker inspect summary ------------------------------------------------------------------------------
 
 def _summarize(raw: dict) -> dict:
-    """Reduz o JSON enorme do docker inspect ao que importa para diagnóstico."""
+    """Reduces the huge docker inspect JSON to the fields that matter for a diagnosis."""
     return {
         "name": raw.get("Name", "").lstrip("/"),
         **_state_summary(raw),
@@ -211,7 +215,7 @@ def _config_summary(raw: dict) -> dict:
         "healthcheck": (config.get("Healthcheck") or {}).get("Test"),
         "entrypoint": config.get("Entrypoint"),
         "command": config.get("Cmd"),
-        # Só os nomes das variáveis: os valores podem conter segredos.
+        # Only the variable names: values may hold secrets.
         "env_vars": [entry.split("=", 1)[0] for entry in config.get("Env") or []],
     }
 
@@ -228,20 +232,20 @@ def _bindings(binds: list[dict] | None) -> list[str] | None:
     return [f"{b.get('HostIp')}:{b.get('HostPort')}" for b in binds] if binds else None
 
 
-# --- ações (sempre passam por aprovação humana no agente) ----------------------
+# --- Actions (the agent always asks for human approval first) ---------------------------------------------
 
 def restart_container(container: str) -> str:
-    return _container_action("restart", container, "reiniciado")
+    return _container_action("restart", container, "docker.restarted")
 
 
 def start_container(container: str) -> str:
-    return _container_action("start", container, "iniciado")
+    return _container_action("start", container, "docker.started")
 
 
 def stop_container(container: str) -> str:
-    return _container_action("stop", container, "parado")
+    return _container_action("stop", container, "docker.stopped")
 
 
-def _container_action(command: str, container: str, done: str) -> str:
+def _container_action(command: str, container: str, done_key: str) -> str:
     _run([command, _name(container)], timeout=ACTION_TIMEOUT)
-    return f"Container '{container}' {done}."
+    return t(done_key, container=container)

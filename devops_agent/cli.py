@@ -1,4 +1,4 @@
-"""Linha de comando: chat, ask, check e watch."""
+"""Command line: chat, ask, check and watch."""
 from __future__ import annotations
 
 import argparse
@@ -9,18 +9,21 @@ import ollama
 from rich.markup import escape
 
 from . import docker_tools as dk
+from . import i18n
 from .agent import Agent
 from .audit import AuditLog
-from .config import Config
+from .config import Config, load_env_file
+from .i18n import t
 from .monitor import Issue, Monitor
-from .ui import ask_approval, console, show_answer, show_dim, show_error, show_ok
+from .ui import ask_approval, console, show_answer, show_dim, show_error, show_ok, spinner
+from .workers import Investigator
 
-EXIT_COMMANDS = {"/sair", "sair", "exit", "quit"}
-RESET_COMMAND = "/limpar"
-CHECK_LOG_WINDOW = 300  # segundos de log analisados pelo comando check
+EXIT_COMMANDS = {"/exit", "/quit", "/sair", "exit", "quit", "sair"}
+RESET_COMMANDS = {"/clear", "/limpar"}
+CHECK_LOG_WINDOW = 300  # seconds of logs scanned by the check command
 
 
-# --- verificação inicial ----------------------------------------------------------
+# --- Startup checks ---------------------------------------------------------------------------------
 
 def preflight(cfg: Config) -> bool:
     docker_ok = _check_docker()
@@ -30,52 +33,38 @@ def preflight(cfg: Config) -> bool:
 
 def _check_docker() -> bool:
     try:
-        show_ok(f"Docker {dk.server_version()}")
+        show_ok(t("cli.docker_ok", version=dk.server_version()))
         return True
     except dk.DockerError as error:
-        show_error("✗ Docker indisponível:", str(error), "Abra o Docker Desktop e tente de novo.")
+        show_error(t("cli.docker_down"), str(error), t("cli.docker_hint"))
         return False
 
 
 def _check_ollama(cfg: Config) -> bool:
     try:
         ollama.Client(host=cfg.ollama_host).show(cfg.model)
-        show_ok(f"Ollama com o modelo {cfg.model}")
+        show_ok(t("cli.ollama_ok", model=cfg.model))
         return True
     except ollama.ResponseError:
-        show_error(f"✗ Modelo '{cfg.model}' não encontrado.", hint=f"Rode: [bold]ollama pull {cfg.model}[/]")
-    except Exception as error:  # conexão recusada, timeout...
-        show_error("✗ Ollama não respondeu:", str(error), "Abra o Ollama e tente de novo.")
+        show_error(t("cli.model_missing", model=cfg.model), hint=t("cli.model_hint", model=cfg.model))
+    except Exception as error:  # connection refused, timeout...
+        show_error(t("cli.ollama_down"), str(error), t("cli.ollama_hint"))
     return False
 
 
-# --- execução de tarefas ----------------------------------------------------------
+# --- Single agent: chat and ask ----------------------------------------------------------------------
 
-def run_task(agent: Agent, task: str, require_evidence: bool = False) -> None:
+def run_task(agent: Agent, task: str) -> None:
     try:
-        show_answer(agent.run(task, require_evidence))
+        show_answer(agent.run(task))
     except ollama.ResponseError as error:
-        show_error("Erro do Ollama:", str(error))
+        show_error(t("cli.ollama_error"), str(error))
     except (ConnectionError, OSError) as error:
-        show_error("Não consegui falar com o Ollama:", str(error))
+        show_error(t("cli.ollama_unreachable"), str(error))
 
-
-def handle_issues(agent: Agent, issues: list[Issue]) -> None:
-    for issue in issues:
-        _show_issue(issue)
-        agent.reset()  # cada problema é investigado do zero
-        run_task(agent, issue.task(), require_evidence=True)
-
-
-def _show_issue(issue: Issue) -> None:
-    console.rule(f"[bold red]Problema em {escape(issue.container)}")
-    console.print(escape(issue.detail))
-
-
-# --- comandos -----------------------------------------------------------------------
 
 def cmd_chat(agent: Agent) -> None:
-    console.print(f"Converse com o agente. [bold]{RESET_COMMAND}[/] zera a conversa, [bold]/sair[/] encerra.\n")
+    console.print(t("cli.chat_intro"))
     while True:
         text = _read_input()
         if text is None or text.lower() in EXIT_COMMANDS:
@@ -84,9 +73,9 @@ def cmd_chat(agent: Agent) -> None:
 
 
 def _read_input() -> str | None:
-    """Lê uma linha do usuário; None quando ele encerra (Ctrl+C / Ctrl+Z)."""
+    """Reads one line; None when the operator quits (Ctrl+C / Ctrl+D)."""
     try:
-        return console.input("[bold green]você>[/] ").strip()
+        return console.input(f"[bold green]{t('cli.prompt')}[/] ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
 
@@ -94,73 +83,122 @@ def _read_input() -> str | None:
 def _chat_turn(agent: Agent, text: str) -> None:
     if not text:
         return
-    if text.lower() == RESET_COMMAND:
+    if text.lower() in RESET_COMMANDS:
         agent.reset()
-        show_dim("conversa zerada")
+        show_dim(t("cli.chat_reset"))
         return
     try:
         run_task(agent, text)
     except KeyboardInterrupt:
-        console.print("[yellow]interrompido[/]")
+        console.print(f"[yellow]{t('cli.interrupted')}[/]")
 
 
 def cmd_ask(agent: Agent, question: str) -> None:
     run_task(agent, question)
 
 
-def cmd_check(agent: Agent, monitor: Monitor) -> None:
+# --- Incidents: check and watch ------------------------------------------------------------------------
+
+def submit_issues(investigator: Investigator, issues: list[Issue]) -> int:
+    """Queues the issues; returns how many were new (not already under investigation)."""
+    submitted = 0
+    for issue in issues:
+        if investigator.submit(issue):
+            _show_issue(issue)
+            submitted += 1
+    return submitted
+
+
+def _show_issue(issue: Issue) -> None:
+    console.rule(f"[bold red]{escape(t('cli.issue_header', container=issue.container))}")
+    console.print(escape(issue.detail))
+
+
+def report_result(issue: Issue, answer: str) -> None:
+    show_answer(answer, label=issue.container)
+
+
+def report_error(issue: Issue, error: Exception) -> None:
+    show_error(t("cli.investigation_failed", container=escape(issue.container)), str(error))
+
+
+def cmd_check(investigator: Investigator, monitor: Monitor) -> None:
     issues = monitor.scan()
     if not issues:
-        console.print("[green]Nenhum problema encontrado.[/]")
+        console.print(f"[green]{t('cli.no_problems')}[/]")
         return
-    console.print(f"[bold]{len(issues)} container(s) com problema.[/]")
-    handle_issues(agent, issues)
+    console.print(f"[bold]{t('cli.problems_found', count=len(issues))}[/]")
+    submit_issues(investigator, issues)
+    investigator.wait()
 
 
-def cmd_watch(agent: Agent, monitor: Monitor, interval: int) -> None:
-    console.print(f"Monitorando a cada {interval}s. [bold]Ctrl+C[/] para parar.\n")
+def cmd_watch(investigator: Investigator, monitor: Monitor, interval: int) -> None:
+    console.print(t("cli.watching", interval=interval, workers=investigator.size))
+    last = None
     while True:
-        handle_issues(agent, monitor.due(_safe_scan(monitor)))
-        _wait(interval)
+        submitted = submit_issues(investigator, monitor.due(_safe_scan(monitor)))
+        last = _heartbeat(submitted, investigator.busy(), last)
+        time.sleep(interval)
 
 
 def _safe_scan(monitor: Monitor) -> list[Issue]:
     try:
         return monitor.scan()
     except dk.DockerError as error:
-        show_error("Erro ao consultar o Docker:", str(error))
+        show_error(t("cli.docker_query_error"), str(error))
         return []
 
 
-def _wait(seconds: int) -> None:
-    stamp = datetime.now().strftime("%H:%M:%S")
-    with console.status(f"[dim]monitorando... última verificação às {stamp}[/]"):
-        time.sleep(seconds)
+def _heartbeat(new: int, running: int, last: tuple[int, int] | None) -> tuple[int, int]:
+    """Prints a status line only when something changed, so idle watching stays quiet."""
+    snapshot = (new, running)
+    if snapshot != last:
+        show_dim(t("cli.heartbeat", time=datetime.now().strftime("%H:%M:%S"), new=new, running=running))
+    return snapshot
 
 
-# --- argumentos -----------------------------------------------------------------------
+def build_investigator(cfg: Config, audit: AuditLog) -> Investigator:
+    def investigate(issue: Issue) -> str:
+        # One Agent per investigation: agents keep conversation state and are not thread-safe.
+        agent = Agent(cfg, console, ask_approval, audit, label=issue.container)
+        return agent.run(issue.task(), require_evidence=True)
+
+    return Investigator(investigate, cfg.workers, on_result=report_result, on_error=report_error)
+
+
+# --- Arguments -----------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="devops_agent", description="Agente de DevOps local (Ollama) para Docker.")
-    parser.add_argument("--model", help="modelo do Ollama (padrão: qwen3:4b ou AGENT_MODEL)")
+    parser = argparse.ArgumentParser(prog="devops-agent", description=t("cli.help.description"))
+    parser.add_argument("--model", help=t("cli.help.model"))
+    parser.add_argument("--lang", help=t("cli.help.lang"))
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("chat", help="conversa interativa com o agente")
-    sub.add_parser("ask", help="faz uma pergunta e sai").add_argument("question", nargs="+")
-    _add_monitor_options(sub.add_parser("check", help="verifica uma vez e diagnostica problemas"))
-    _add_watch_options(sub.add_parser("watch", help="monitora continuamente"))
+    sub.add_parser("chat", help=t("cli.help.chat"))
+    sub.add_parser("ask", help=t("cli.help.ask")).add_argument("question", nargs="+")
+    _add_monitor_options(sub.add_parser("check", help=t("cli.help.check")))
+    _add_watch_options(sub.add_parser("watch", help=t("cli.help.watch")))
     return parser
 
 
 def _add_monitor_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--only", help="só estes containers (separados por vírgula)")
-    parser.add_argument("--scan-logs", action="store_true", help="também procura linhas de erro nos logs")
+    parser.add_argument("--only", help=t("cli.help.only"))
+    parser.add_argument("--scan-logs", action="store_true", help=t("cli.help.scan_logs"))
+    parser.add_argument("--workers", type=int, help=t("cli.help.workers"))
 
 
 def _add_watch_options(parser: argparse.ArgumentParser) -> None:
     _add_monitor_options(parser)
-    parser.add_argument("--interval", type=int, default=30, help="segundos entre verificações (padrão 30)")
-    parser.add_argument("--cooldown", type=int, default=600, help="segundos antes de alertar de novo o mesmo container")
+    parser.add_argument("--interval", type=int, default=30, help=t("cli.help.interval"))
+    parser.add_argument("--cooldown", type=int, default=600, help=t("cli.help.cooldown"))
+
+
+def _language_argument(argv: list[str] | None) -> str | None:
+    """Reads --lang before building the parser, so the help text is already translated."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--lang")
+    known, _ = pre.parse_known_args(argv)
+    return known.lang
 
 
 def _parse_only(value: str | None) -> set[str] | None:
@@ -169,10 +207,11 @@ def _parse_only(value: str | None) -> set[str] | None:
     return {name.strip() for name in value.split(",") if name.strip()}
 
 
-def _build_config(args: argparse.Namespace) -> Config:
-    cfg = Config()
+def _apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     if args.model:
         cfg.model = args.model
+    if getattr(args, "workers", None):
+        cfg.workers = args.workers
     return cfg
 
 
@@ -183,25 +222,27 @@ def _build_monitor(args: argparse.Namespace) -> Monitor:
     return Monitor(only=only, scan_logs=args.scan_logs, log_window=args.interval, cooldown=args.cooldown)
 
 
-def _dispatch(args: argparse.Namespace, agent: Agent) -> None:
+def _dispatch(args: argparse.Namespace, cfg: Config, audit: AuditLog) -> None:
     if args.command == "chat":
-        cmd_chat(agent)
+        cmd_chat(Agent(cfg, console, ask_approval, audit, progress=spinner))
     elif args.command == "ask":
-        cmd_ask(agent, " ".join(args.question))
+        cmd_ask(Agent(cfg, console, ask_approval, audit, progress=spinner), " ".join(args.question))
     elif args.command == "check":
-        cmd_check(agent, _build_monitor(args))
+        cmd_check(build_investigator(cfg, audit), _build_monitor(args))
     else:
-        cmd_watch(agent, _build_monitor(args), args.interval)
+        cmd_watch(build_investigator(cfg, audit), _build_monitor(args), args.interval)
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file()
+    cfg = Config()
+    cfg.language = i18n.set_language(_language_argument(argv) or cfg.language)
     args = build_parser().parse_args(argv)
-    cfg = _build_config(args)
+    _apply_overrides(cfg, args)
     if not preflight(cfg):
         return 1
-    agent = Agent(cfg, console, ask_approval, AuditLog(cfg.audit_file))
     try:
-        _dispatch(args, agent)
+        _dispatch(args, cfg, AuditLog(cfg.audit_file))
     except KeyboardInterrupt:
-        show_dim("\nencerrado")
+        show_dim(t("cli.stopped"))
     return 0

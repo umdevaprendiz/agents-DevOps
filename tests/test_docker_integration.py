@@ -1,4 +1,4 @@
-"""Testes contra o Docker real (só leitura). Pulados se o Docker não estiver rodando."""
+"""Read-only tests against the real Docker daemon. Skipped when Docker is not running."""
 import pytest
 
 from devops_agent import docker_tools as dk
@@ -14,7 +14,7 @@ def _docker_running() -> bool:
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _docker_running(), reason="Docker não está rodando"),
+    pytest.mark.skipif(not _docker_running(), reason="Docker is not running"),
 ]
 
 
@@ -25,12 +25,12 @@ def test_list_containers_returns_expected_fields():
 
 def test_inspect_unknown_container_raises():
     with pytest.raises(dk.DockerError):
-        dk.inspect_container("container-que-nao-existe-123")
+        dk.inspect_container("container-that-does-not-exist-123")
 
 
 def test_inspect_matches_listed_container():
     containers = dk.list_containers()
     if not containers:
-        pytest.skip("nenhum container para inspecionar")
+        pytest.skip("no container to inspect")
     name = containers[0]["name"]
     assert dk.inspect_container(name)["name"] == name

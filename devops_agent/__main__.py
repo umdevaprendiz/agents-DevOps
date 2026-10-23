@@ -1,4 +1,4 @@
-"""Permite rodar com: python -m devops_agent <comando>."""
+"""Allows running: python -m devops_agent <command>."""
 import sys
 
 from .cli import main

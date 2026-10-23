@@ -5,17 +5,24 @@ import pytest
 from rich.console import Console
 from rich.prompt import InvalidResponse
 
-from devops_agent import cli
+from devops_agent import cli, i18n
+from devops_agent.config import Config
 from devops_agent.monitor import Issue
 from devops_agent.ui import YesNoConfirm
 
 
 @pytest.fixture
 def output(monkeypatch):
-    """Captura o que a CLI escreve no terminal."""
+    """Captures what the CLI writes to the terminal."""
     buffer = io.StringIO()
     monkeypatch.setattr(cli, "console", Console(file=buffer, width=120))
     return buffer
+
+
+@pytest.fixture(autouse=True)
+def no_env_file(monkeypatch):
+    """main() must not read a developer's local .env during tests."""
+    monkeypatch.setattr(cli, "load_env_file", lambda: False)
 
 
 class FakeAgent:
@@ -28,10 +35,32 @@ class FakeAgent:
 
     def run(self, task, require_evidence=False):
         self.runs.append((task, require_evidence))
-        return f"resposta {len(self.runs)}"
+        return f"answer {len(self.runs)}"
 
 
-# --- argumentos -------------------------------------------------------------------------
+class FakeInvestigator:
+    size = 3
+
+    def __init__(self, busy_containers=()):
+        self.submitted = []
+        self.waited = False
+        self._busy = set(busy_containers)
+
+    def submit(self, issue):
+        if issue.container in self._busy:
+            return False
+        self._busy.add(issue.container)
+        self.submitted.append(issue)
+        return True
+
+    def busy(self):
+        return len(self._busy)
+
+    def wait(self):
+        self.waited = True
+
+
+# --- Arguments ---------------------------------------------------------------------------------------
 
 def test_parse_only_splits_and_trims_names():
     assert cli._parse_only(" api, web ,,db ") == {"api", "web", "db"}
@@ -40,12 +69,13 @@ def test_parse_only_splits_and_trims_names():
 
 def test_watch_defaults():
     args = cli.build_parser().parse_args(["watch"])
-    assert (args.interval, args.cooldown, args.scan_logs, args.only) == (30, 600, False, None)
+    assert (args.interval, args.cooldown, args.scan_logs, args.only, args.workers) == (30, 600, False, None, None)
 
 
-def test_model_option_overrides_config():
-    args = cli.build_parser().parse_args(["--model", "qwen3:8b", "check"])
-    assert cli._build_config(args).model == "qwen3:8b"
+def test_overrides_from_arguments():
+    args = cli.build_parser().parse_args(["--model", "qwen3:8b", "check", "--workers", "6"])
+    cfg = cli._apply_overrides(Config(), args)
+    assert (cfg.model, cfg.workers) == ("qwen3:8b", 6)
 
 
 def test_command_is_required():
@@ -65,32 +95,94 @@ def test_watch_monitor_uses_interval_and_cooldown():
     assert (monitor.log_window, monitor.cooldown) == (15, 90)
 
 
-# --- comandos ----------------------------------------------------------------------------
+def test_language_argument_is_read_before_parsing():
+    assert cli._language_argument(["--lang", "pt-BR", "check"]) == "pt-BR"
+    assert cli._language_argument(["check"]) is None
+
+
+# --- main ------------------------------------------------------------------------------------------
 
 def test_main_stops_when_preflight_fails(monkeypatch):
     monkeypatch.setattr(cli, "preflight", lambda cfg: False)
     assert cli.main(["check"]) == 1
 
 
+def test_main_applies_the_language_flag(monkeypatch):
+    monkeypatch.setattr(cli, "preflight", lambda cfg: False)
+    cli.main(["--lang", "pt-BR", "check"])
+    assert i18n.get_language() == "pt-BR"
+
+
+# --- Incidents ---------------------------------------------------------------------------------------
+
 def test_check_without_issues(output):
-    cli.cmd_check(FakeAgent(), SimpleNamespace(scan=lambda: []))
-    assert "Nenhum problema encontrado." in output.getvalue()
+    cli.cmd_check(FakeInvestigator(), SimpleNamespace(scan=lambda: []))
+    assert "No problems found." in output.getvalue()
 
 
-def test_each_issue_is_investigated_from_scratch_with_evidence(monkeypatch, output):
+def test_check_submits_every_issue_and_waits(output):
+    investigator = FakeInvestigator()
+    issues = [Issue("api", ("x",)), Issue("web", ("y",))]
+    cli.cmd_check(investigator, SimpleNamespace(scan=lambda: issues))
+    assert investigator.submitted == issues
+    assert investigator.waited
+
+
+def test_issues_already_under_investigation_are_not_announced_again(output):
+    investigator = FakeInvestigator(busy_containers={"api"})
+    submitted = cli.submit_issues(investigator, [Issue("api", ("x",)), Issue("web", ("y",))])
+    assert submitted == 1
+    assert "Problem in web" in output.getvalue()
+    assert "Problem in api" not in output.getvalue()
+
+
+def test_results_are_shown_with_the_container_label(monkeypatch):
     shown = []
-    monkeypatch.setattr(cli, "show_answer", shown.append)
-    agent = FakeAgent()
-    cli.handle_issues(agent, [Issue("api", ("parou",)), Issue("web", ("unhealthy",))])
-    assert agent.resets == 2
-    assert [require for _, require in agent.runs] == [True, True]
-    assert "'api'" in agent.runs[0][0]
-    assert shown == ["resposta 1", "resposta 2"]
+    monkeypatch.setattr(cli, "show_answer", lambda answer, label=None: shown.append((answer, label)))
+    cli.report_result(Issue("api", ("x",)), "fixed")
+    assert shown == [("fixed", "api")]
 
 
-def test_chat_turn_handles_reset_command(output):
+def test_heartbeat_prints_only_when_something_changes(monkeypatch):
+    printed = []
+    monkeypatch.setattr(cli, "show_dim", printed.append)
+    last = cli._heartbeat(0, 0, None)
+    last = cli._heartbeat(0, 0, last)
+    cli._heartbeat(1, 1, last)
+    assert len(printed) == 2
+
+
+def test_investigator_runs_one_agent_per_issue_with_evidence(monkeypatch):
+    created = []
+
+    class RecordingAgent(FakeAgent):
+        def __init__(self, cfg, console, approver, audit, label=None, progress=None):
+            super().__init__()
+            self.label = label
+            created.append(self)
+
+    results = []
+    monkeypatch.setattr(cli, "Agent", RecordingAgent)
+    monkeypatch.setattr(cli, "report_result", lambda issue, answer: results.append((issue.container, answer)))
+    cfg = Config()
+    cfg.workers = 2
+    investigator = cli.build_investigator(cfg, SimpleNamespace(log=lambda *a, **k: None))
+
+    for name in ("api", "web"):
+        investigator.submit(Issue(name, ("x",)))
+    investigator.wait()
+
+    assert sorted(agent.label for agent in created) == ["api", "web"]
+    assert all(agent.runs[0][1] is True for agent in created)
+    assert sorted(results) == [("api", "answer 1"), ("web", "answer 1")]
+
+
+# --- Chat ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("command", ["/clear", "/limpar"])
+def test_chat_turn_handles_reset_commands(output, command):
     agent = FakeAgent()
-    cli._chat_turn(agent, "/limpar")
+    cli._chat_turn(agent, command)
     assert agent.resets == 1 and agent.runs == []
 
 
@@ -100,13 +192,21 @@ def test_chat_turn_ignores_empty_input():
     assert agent.runs == []
 
 
-# --- confirmação --------------------------------------------------------------------------
+# --- Confirmation --------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("value, expected", [("s", True), ("SIM", True), ("y", True), ("n", False), ("não", False), ("no", False)])
-def test_yes_no_confirm_accepts_portuguese_and_english(value, expected):
-    assert YesNoConfirm("Permitir?").process_response(value) is expected
+@pytest.mark.parametrize(
+    "value, expected", [("y", True), ("YES", True), ("s", True), ("sim", True), ("n", False), ("não", False)]
+)
+def test_yes_no_confirm_accepts_english_and_portuguese(value, expected):
+    assert YesNoConfirm("Allow?").process_response(value) is expected
+
+
+def test_yes_no_confirm_shows_choices_in_the_current_language():
+    assert YesNoConfirm("Allow?").choices == ["y", "n"]
+    i18n.set_language("pt-BR")
+    assert YesNoConfirm("Permitir?").choices == ["s", "n"]
 
 
 def test_yes_no_confirm_rejects_other_answers():
     with pytest.raises(InvalidResponse):
-        YesNoConfirm("Permitir?").process_response("talvez")
+        YesNoConfirm("Allow?").process_response("maybe")

@@ -1,4 +1,4 @@
-"""Fixtures compartilhadas. Os testes de unidade não precisam de Docker nem de Ollama rodando."""
+"""Shared fixtures. Unit tests need neither Docker nor Ollama running."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -7,22 +7,32 @@ from types import SimpleNamespace
 import pytest
 from ollama import Message
 
+from devops_agent import i18n
+
 NOW = datetime.now(timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def english():
+    """Tests assert English texts; a test can switch with i18n.set_language and is reset afterwards."""
+    i18n.set_language("en")
+    yield
+    i18n.set_language("en")
+
+
 def docker_time(moment: datetime) -> str:
-    """Formata a data como o Docker: nanossegundos e sufixo Z."""
+    """Formats a date the way Docker does: nanoseconds and a Z suffix."""
     return moment.strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
 
 
 def assistant(content: str = "", calls: list[tuple[str, dict]] | None = None) -> Message:
-    """Mensagem do modelo. calls = [(nome_da_ferramenta, argumentos), ...]."""
+    """A model message. calls = [(tool_name, arguments), ...]."""
     tool_calls = [Message.ToolCall(function=Message.ToolCall.Function(name=n, arguments=a)) for n, a in calls or []]
     return Message(role="assistant", content=content, tool_calls=tool_calls or None)
 
 
 class FakeClient:
-    """Substitui ollama.Client: devolve respostas roteirizadas e registra cada chamada."""
+    """Replaces ollama.Client: returns scripted replies and records every call."""
 
     def __init__(self, *replies):
         self.replies = list(replies)
@@ -38,7 +48,7 @@ class FakeClient:
 
 @pytest.fixture
 def make_info():
-    """Fabrica o dicionário devolvido por docker_tools._summarize, com valores de um container saudável."""
+    """Builds the dict returned by docker_tools._summarize, defaulting to a healthy container."""
 
     def factory(**overrides) -> dict:
         info = {

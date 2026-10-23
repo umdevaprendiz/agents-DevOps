@@ -1,4 +1,17 @@
+# Python
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Runtime data: the audit log may contain (redacted) container logs
 logs/
+*.log
+
+# Secrets: never commit real environment files
+.env
+.env.*
+!.env.example

@@ -1,7 +1,9 @@
-"""Terminal: saída formatada e pedido de aprovação."""
+"""Terminal: formatted output and approval prompts."""
 from __future__ import annotations
 
 import sys
+import threading
+from contextlib import AbstractContextManager
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -9,14 +11,18 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm, InvalidResponse
 
+from .i18n import t
 from .tools import Tool
 
-YES_ANSWERS = {"s", "sim", "y", "yes"}
-NO_ANSWERS = {"n", "nao", "não", "no"}
+YES_ANSWERS = {"y", "yes", "s", "sim"}
+NO_ANSWERS = {"n", "no", "nao", "não"}
+
+# Parallel workers take turns at the terminal: one approval prompt at a time.
+_APPROVAL_LOCK = threading.Lock()
 
 
 def _make_console() -> Console:
-    # Evita erro de encoding no Windows quando a saída é redirecionada (ex.: para um arquivo).
+    # Avoids encoding crashes on Windows when the output is redirected (e.g. to a file).
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
@@ -27,10 +33,12 @@ console = _make_console()
 
 
 class YesNoConfirm(Confirm):
-    """Confirmação s/n que aceita respostas em português e inglês."""
+    """Yes/no prompt in the current language that accepts English and Portuguese answers."""
 
-    choices = ["s", "n"]
-    validate_error_message = "[prompt.invalid]Digite s ou n"
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.choices = [t("ui.yes"), t("ui.no")]
+        self.validate_error_message = t("ui.invalid_yes_no", yes=t("ui.yes"), no=t("ui.no"))
 
     def process_response(self, value: str) -> bool:
         answer = value.strip().lower()
@@ -42,33 +50,35 @@ class YesNoConfirm(Confirm):
 
 
 def ask_approval(tool: Tool, args: dict) -> bool:
-    """Pergunta ao operador se a ação pode rodar. Na dúvida (Enter, Ctrl+C, sem terminal), nega."""
-    _show_approval_request(tool, args)
-    try:
-        return YesNoConfirm.ask("Permitir?", default=False, console=console)
-    except (EOFError, KeyboardInterrupt):
-        return False
+    """Asks the operator whether the action may run. Enter, Ctrl+C or no terminal means no."""
+    with _APPROVAL_LOCK:
+        _show_approval_request(tool, args)
+        try:
+            return YesNoConfirm.ask(t("ui.allow"), default=False, console=console)
+        except (EOFError, KeyboardInterrupt):
+            return False
 
 
 def _show_approval_request(tool: Tool, args: dict) -> None:
-    target = escape(str(args.get("container", "?")))
-    console.print(
-        Panel(
-            f"O agente quer executar [bold]{tool.name}[/] no container [bold]{target}[/].",
-            title="Aprovação necessária",
-            border_style="yellow",
-        )
-    )
+    container = escape(str(args.get("container", "?")))
+    message = t("ui.approval_request", tool=tool.name, container=container)
+    console.print(Panel(message, title=t("ui.approval_title"), border_style="yellow"))
 
 
-def show_answer(answer: str) -> None:
-    text = _hard_line_breaks(answer or "_(o modelo não respondeu)_")
-    console.print(Panel(Markdown(text), title="Agente", border_style="blue"))
+def show_answer(answer: str, label: str | None = None) -> None:
+    title = t("ui.answer_title") + (f" · {escape(label)}" if label else "")
+    text = _hard_line_breaks(answer or t("ui.no_answer"))
+    console.print(Panel(Markdown(text), title=title, border_style="blue"))
 
 
 def _hard_line_breaks(text: str) -> str:
-    """Em Markdown uma quebra simples vira espaço; '  \\n' mantém a quebra que o modelo quis."""
+    """In Markdown a single line break becomes a space; '  \\n' keeps the break the model meant."""
     return text.replace("\n", "  \n")
+
+
+def spinner(message: str) -> AbstractContextManager:
+    """Progress indicator for single-agent commands (chat, ask)."""
+    return console.status(f"[dim]{escape(message)}[/]", spinner="dots")
 
 
 def show_ok(message: str) -> None:
@@ -81,4 +91,4 @@ def show_error(message: str, detail: str = "", hint: str = "") -> None:
 
 
 def show_dim(message: str) -> None:
-    console.print(f"[dim]{message}[/]")
+    console.print(f"[dim]{escape(message)}[/]")

@@ -1,17 +1,18 @@
-# Containers com defeitos de propósito, para testar o agente.
+# Containers broken on purpose, to try the agent.
 #   docker compose -f demo/docker-compose.yml up -d
+#   devops-agent check
 #   docker compose -f demo/docker-compose.yml down
 name: devops-agent-demo
 
 services:
-  # Saudável: serve de controle.
+  # Healthy: the control group.
   web:
     image: nginx:alpine
     container_name: demo-web
     ports:
       - "8080:80"
 
-  # Healthcheck aponta para a porta errada (8081), então fica "unhealthy".
+  # The healthcheck probes the wrong port (8081), so the container turns "unhealthy".
   web-unhealthy:
     image: nginx:alpine
     container_name: demo-web-unhealthy
@@ -21,14 +22,14 @@ services:
       timeout: 3s
       retries: 2
 
-  # Cai porque o banco não existe. Reiniciar não resolve.
+  # Crashes because the database does not exist. Restarting will not help.
   api:
     image: alpine:3.20
     container_name: demo-api
     restart: "no"
-    command: ["sh", "-c", "echo 'Iniciando API na porta 3000...'; sleep 3; echo 'ERROR: could not connect to database at postgres:5432 (connection refused)'; exit 1"]
+    command: ["sh", "-c", "echo 'Starting API on port 3000...'; sleep 3; echo 'ERROR: could not connect to database at postgres:5432 (connection refused)'; exit 1"]
 
-  # Falta uma variável de ambiente; com restart: always, fica em loop de reinício.
+  # A required environment variable is missing; with restart: always it loops forever.
   worker:
     image: alpine:3.20
     container_name: demo-worker

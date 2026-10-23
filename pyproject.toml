@@ -1,7 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devops-agent"
+dynamic = ["version"]
+description = "Autonomous DevOps agent that watches Docker containers, investigates failures with a local LLM (Ollama) and fixes them with human approval."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ollama>=0.5.1",
+    "rich>=13.7",
+]
+keywords = ["devops", "docker", "ollama", "llm", "agent", "monitoring", "sre"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pre-commit>=3",
+]
+
+[project.scripts]
+devops-agent = "devops_agent.cli:main"
+
+[project.urls]
+Repository = "https://github.com/umdevaprendiz/agents-DevOps"
+
+[tool.setuptools.dynamic]
+version = { attr = "devops_agent.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["devops_agent*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
 markers = [
-    "integration: precisa do Docker rodando (pulado automaticamente se não estiver)",
+    "integration: needs a running Docker daemon (skipped automatically otherwise)",
 ]

@@ -1,0 +1,18 @@
+# Keep secrets and local data out of the image
+.env
+.env.*
+logs/
+*.log
+
+# Not needed at runtime
+.git/
+.github/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+demo/
+build/
+dist/
+*.egg-info/

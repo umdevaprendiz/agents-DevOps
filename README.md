@@ -1,144 +1,164 @@
 # DevOps Agent
 
-Agente autônomo de DevOps que monitora containers Docker, investiga falhas com um LLM local (Ollama) e propõe ou executa correções **com aprovação humana**.
+[![CI](https://github.com/umdevaprendiz/agents-DevOps/actions/workflows/ci.yml/badge.svg)](https://github.com/umdevaprendiz/agents-DevOps/actions/workflows/ci.yml)
 
-- **Local:** o modelo roda no Ollama da própria máquina, então logs e configurações não saem dela.
-- **Monitor sem IA:** a detecção de problemas usa regras determinísticas, e o modelo só é chamado quando há algo para investigar.
-- **Seguro por padrão:** o modelo não tem shell, só ferramentas tipadas. Ações que alteram estado exigem confirmação.
-- **Auditável:** todo evento vai para `logs/audit.jsonl`.
+🇧🇷 [Leia em português](README.pt-BR.md)
 
----
+An autonomous DevOps agent that watches Docker containers, investigates failures with a **local LLM** (Ollama) and proposes or applies fixes **with human approval**.
 
-## Sumário
+- **Private by default:** the model runs on your own Ollama, so logs never leave your network.
+- **Cheap detection:** problems are found by deterministic rules; the LLM is only called when something is wrong.
+- **Parallel:** detected incidents go into a queue consumed by N workers, and scanning never stops while investigations run.
+- **Safe:** there is no shell tool, arguments are validated, every state change needs human approval, and secrets are redacted before they reach the model or the disk.
+- **Auditable:** every task, tool call, approval and answer is a JSON line in `logs/audit.jsonl`.
+- **Bilingual:** English and Brazilian Portuguese, covering the agent's answers, the CLI and the docs.
 
-1. [Início rápido](#início-rápido)
-2. [Arquitetura](#arquitetura)
-3. [Fluxo de um incidente](#fluxo-de-um-incidente)
-4. [Referência dos módulos](#referência-dos-módulos)
-5. [Ferramentas expostas ao modelo](#ferramentas-expostas-ao-modelo)
-6. [Regras de detecção do monitor](#regras-de-detecção-do-monitor)
-7. [Loop do agente](#loop-do-agente)
-8. [Modelo de segurança](#modelo-de-segurança)
-9. [Configuração](#configuração)
-10. [CLI](#cli)
-11. [Log de auditoria](#log-de-auditoria)
-12. [Testes](#testes)
-13. [Ambiente de teste](#ambiente-de-teste)
-14. [Como estender](#como-estender)
-15. [Convenções de código](#convenções-de-código)
-16. [Limitações conhecidas](#limitações-conhecidas)
-17. [Roadmap](#roadmap)
+> ⚠️ **No license yet.** The code is public to read, but until a license is added all rights are reserved.
 
 ---
 
-## Início rápido
+## Contents
 
-**Requisitos:** Python 3.10+, Docker (Desktop ou Engine) e Ollama.
+1. [Quick start](#quick-start)
+2. [Architecture](#architecture)
+3. [Incident flow](#incident-flow)
+4. [Module reference](#module-reference)
+5. [Tools exposed to the model](#tools-exposed-to-the-model)
+6. [Monitor rules](#monitor-rules)
+7. [Agent loop](#agent-loop)
+8. [Parallel investigations](#parallel-investigations)
+9. [Security](#security)
+10. [Configuration](#configuration)
+11. [Languages](#languages)
+12. [Running in Docker](#running-in-docker)
+13. [Audit log](#audit-log)
+14. [Testing](#testing)
+15. [Demo environment](#demo-environment)
+16. [Extending](#extending)
+17. [Choosing a model](#choosing-a-model)
+18. [Code conventions](#code-conventions)
+19. [Known limitations](#known-limitations)
+20. [Roadmap](#roadmap)
+21. [Contributing](#contributing)
 
-```powershell
-ollama pull qwen3:4b
+---
+
+## Quick start
+
+**Requirements:** Python 3.10+, Docker and [Ollama](https://ollama.com).
+
+```bash
+git clone https://github.com/umdevaprendiz/agents-DevOps.git
+cd agents-DevOps
 python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e .
 
-.\.venv\Scripts\python -m devops_agent check            # diagnostica o que estiver quebrado
-.\.venv\Scripts\python -m devops_agent watch --scan-logs # monitora continuamente
-.\.venv\Scripts\python -m devops_agent chat             # conversa livre com o agente
+ollama pull qwen3:4b
+cp .env.example .env               # optional: fill in only what you want to change
+
+devops-agent check                 # scan once and investigate whatever is broken
+devops-agent watch --scan-logs     # keep watching
+devops-agent chat                  # free conversation with the agent
 ```
 
-Dependências de runtime: [`ollama`](https://pypi.org/project/ollama/) (cliente Python da API do Ollama) e [`rich`](https://pypi.org/project/rich/) (saída no terminal).
+Runtime dependencies: [`ollama`](https://pypi.org/project/ollama/) (Python client) and [`rich`](https://pypi.org/project/rich/) (terminal output).
 
 ---
 
-## Arquitetura
+## Architecture
 
 ```mermaid
 flowchart LR
-    CLI["cli.py<br/>comandos"] --> Monitor["monitor.py<br/>Monitor"]
-    CLI --> Agent["agent.py<br/>Agent"]
-    Monitor -- "Issue" --> Agent
-    Monitor --> DT["docker_tools.py"]
-    Agent <-- "/api/chat + tools" --> Ollama[("Ollama")]
-    Agent --> Tools["tools.py<br/>TOOLS"]
-    Tools --> DT
-    DT -- "docker CLI<br/>(sem shell)" --> Docker[("Docker Engine")]
-    Agent --> Audit["audit.py<br/>logs/audit.jsonl"]
-    Agent -. "needs_approval" .-> UI["ui.py<br/>YesNoConfirm"]
-    UI -.-> Human(("Operador"))
+    CLI["cli.py"] --> Monitor["Monitor<br/>rules, no LLM"]
+    Monitor -- "Issue" --> Queue[["Investigator<br/>queue"]]
+    Queue --> W1["worker 1<br/>Agent"]
+    Queue --> WN["worker N<br/>Agent"]
+    W1 <--> Ollama[("Ollama")]
+    WN <--> Ollama
+    W1 --> Tools["tools.py"]
+    WN --> Tools
+    Tools --> DT["docker_tools.py"]
+    DT -- "docker CLI, no shell" --> Docker[("Docker daemon<br/>local or DOCKER_HOST")]
+    Tools -. "output" .-> Redact["redaction.py"]
+    W1 --> Audit["AuditLog<br/>logs/audit.jsonl"]
+    W1 -. "needs_approval" .-> UI["ui.ask_approval"]
 ```
 
-| Camada | Responsabilidade | Usa IA? |
+| Layer | Responsibility | Uses the LLM? |
 |---|---|---|
-| `Monitor` | Varre os containers e aplica regras para gerar `Issue` | Não |
-| `Agent` | Investiga um `Issue` ou pergunta, chamando ferramentas em loop | Sim |
-| `Tool` / `docker_tools` | Executa comandos Docker com argumentos fixos e validados | Não |
-| `ui` / `cli` | Entrada, saída e aprovação no terminal | Não |
+| `Monitor` | Scans containers and applies rules that produce `Issue`s | No |
+| `Investigator` | Queue plus worker threads; one investigation per container at a time | No |
+| `Agent` | Investigates an `Issue` or a question, calling tools in a loop | Yes |
+| `Tool` / `docker_tools` | Runs Docker commands with fixed, validated arguments | No |
+| `redaction` | Hides secrets in tool outputs, log examples and audit records | No |
+| `ui` / `cli` / `i18n` | Terminal I/O, approvals and translations | No |
 
-### Estrutura de arquivos
+### Project layout
 
 ```
 devops_agent/
-  __main__.py      entrypoint: python -m devops_agent
-  cli.py           parser de argumentos, preflight e comandos (chat, ask, check, watch)
-  ui.py            console Rich, YesNoConfirm, pedido de aprovação, exibição de respostas
-  agent.py         Agent: loop modelo → ferramenta → resultado
-  prompts.py       system prompt e mensagens fixas enviadas ao modelo
-  tools.py         Tool, catálogo TOOLS e schemas enviados ao Ollama
-  docker_tools.py  wrapper da CLI do Docker (leitura, resumo do inspect, ações)
-  monitor.py       Issue, Monitor e regras de detecção
-  audit.py         AuditLog (JSON Lines)
-  config.py        Config (variáveis de ambiente)
-demo/
-  docker-compose.yml   containers com defeitos de propósito para teste
-tests/                 suíte pytest (veja "Testes")
-pyproject.toml         configuração do pytest
-requirements-dev.txt   dependências de desenvolvimento (pytest)
-logs/
-  audit.jsonl          gerado em runtime (ignorado pelo git)
+  __main__.py      python -m devops_agent
+  cli.py           argument parsing, preflight, commands (chat, ask, check, watch)
+  ui.py            Rich console, YesNoConfirm, approval prompt, answer rendering
+  agent.py         Agent: model → tool → result loop
+  workers.py       Investigator: queue + parallel worker threads
+  monitor.py       Issue, Monitor and detection rules
+  tools.py         Tool, the TOOLS catalog and the schemas sent to Ollama
+  docker_tools.py  Docker CLI wrapper (reads, inspect summary, actions)
+  redaction.py     secret masking
+  audit.py         AuditLog (JSON Lines, thread-safe)
+  config.py        Config and .env loading
+  i18n.py          t(), language detection
+  locales/         en.py, pt_br.py (message catalogs)
+tests/             pytest suite (see "Testing")
+demo/              containers broken on purpose
+Dockerfile         runtime image (non-root)
+.env.example       variable names only, no values
+SECURITY.md        security policy and how to report vulnerabilities
 ```
 
-### Diagrama de classes
+### Class diagram
 
 ```mermaid
 classDiagram
     class Config {
         +str model
         +str ollama_host
+        +str language
+        +int workers
         +int max_steps
         +int num_ctx
         +int max_tool_output
         +Path audit_file
     }
     class Agent {
-        +Config cfg
+        +str label
         +list messages
         +reset()
-        +run(task) str
-        -_solve(task) str
+        +run(task, require_evidence) str
+        -_solve(task, require_evidence) str
         -_step() str
-        -_ask_model(with_tools)
         -_execute(name, args) str
-        -_approve(tool, args) bool
         -_invoke(tool, args) str
-        -_trim_history(keep_turns)
+    }
+    class Investigator {
+        +int size
+        +submit(issue) bool
+        +busy() int
+        +wait()
     }
     class Tool {
         +str name
-        +str description
         +dict params
-        +tuple required
-        +Callable func
         +bool needs_approval
         +str keep
         +schema() dict
         +run(args) str
     }
     class Monitor {
-        +set only
-        +bool scan_logs
-        +int cooldown
         +scan() list~Issue~
         +due(issues) list~Issue~
-        -_check(info, now) Issue
     }
     class Issue {
         +str container
@@ -147,7 +167,6 @@ classDiagram
         +task() str
     }
     class AuditLog {
-        +Path path
         +log(event, data)
     }
     class YesNoConfirm {
@@ -159,403 +178,469 @@ classDiagram
     Confirm <|-- YesNoConfirm
     Agent --> Config
     Agent --> AuditLog
-    Agent ..> Tool : executa
-    Monitor ..> Issue : cria
-    Agent ..> Issue : investiga
+    Agent ..> Tool : runs
+    Monitor ..> Issue : creates
+    Investigator ..> Issue : queues
+    Investigator ..> Agent : one per issue
 ```
 
 ---
 
-## Fluxo de um incidente
+## Incident flow
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant M as Monitor
-    participant A as Agent
+    participant I as Investigator
+    participant A as Agent (worker)
     participant O as Ollama
     participant T as Tool / Docker
-    participant H as Operador
+    participant H as Operator
 
-    M->>T: docker ps -a + docker inspect
-    M->>M: aplica regras → Issue("demo-api", "parou com exit code 1")
-    M->>A: run(issue.task())
-    loop até max_steps
-        A->>O: chat(messages, tools=TOOL_SCHEMAS, think=False)
-        O-->>A: tool_calls: inspect_container / get_container_logs
+    M->>T: docker ps -a + one docker inspect
+    M->>M: rules → Issue("demo-api", "stopped with exit code 1")
+    M->>I: submit(issue)  (skipped if already queued or running)
+    I->>A: new Agent(label="demo-api").run(task, require_evidence=True)
+    loop up to max_steps
+        A->>O: chat(messages, tools, think=False)
+        O-->>A: tool_calls
         A->>T: Tool.run(args)
-        T-->>A: JSON / texto (truncado)
+        T-->>A: output → redact → truncate
     end
-    opt ação que altera estado
-        A->>H: "Permitir restart_container em X?" (s/N)
-        H-->>A: s ou n
+    opt state-changing action
+        A->>H: "Allow restart_container on demo-api?" (y/N)
+        H-->>A: y or n
     end
-    O-->>A: resposta final (Diagnóstico / Causa / Ação)
-    A->>A: AuditLog.log("answer")
+    O-->>A: final answer (Diagnosis / Probable cause / Action)
+    A-->>I: answer
+    I-->>H: panel "Agent · demo-api"
 ```
 
 ---
 
-## Referência dos módulos
+## Module reference
 
 ### `config.py`
 
-**`Config`** (dataclass): configurações lidas de variáveis de ambiente no momento da criação. Veja a tabela em [Configuração](#configuração).
+- **`Config`** (dataclass): settings read from the environment when it is created. Empty values count as unset, so the empty lines of `.env.example` are harmless.
+- `load_env_file(path=None)` loads `KEY=VALUE` lines into `os.environ` without overriding variables that are already set. The default location is `.env`, or `AGENT_ENV_FILE`. It understands comments, `export`, quotes and values containing `=`.
 
 ### `docker_tools.py`
 
-Wrapper da CLI `docker`. Toda execução passa por `_run(args, timeout, merge_stderr)`:
+Everything goes through `_run(args, timeout, merge_stderr)`, which calls `subprocess.run(["docker", *args])` (no shell) and raises **`DockerError`** on a non-zero exit, a missing CLI or a timeout.
 
-| Função | Papel |
+| Function | Role |
 |---|---|
-| `_run` | Executa e lança `DockerError` se o código de saída for diferente de 0 |
-| `_invoke` | `subprocess.run(["docker", *args])` sem shell, UTF-8 e timeout |
-| `_error_message` | Extrai a mensagem de erro do stderr (ou do stdout, quando mesclado) |
-| `_name` | Valida nome de container: `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$` |
-| `_since` | Valida janela de log: `^\d+[smh]$` |
-| `_as_bool`, `_clamp`, `_json_lines` | Normalizam entradas vindas do modelo e saídas `{{json .}}` |
-| `parse_docker_time` | Converte timestamps do Docker (nanossegundos, `Z`) em `datetime`; retorna `None` para `0001-01-01` |
+| `_name`, `_since` | Validate the container name (`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`) and the log window (`^\d+[smh]$`) |
+| `_as_bool`, `_clamp`, `_json_lines` | Normalize values coming from the model and `{{json .}}` output |
+| `parse_docker_time` | Parses Docker timestamps (nanoseconds, `Z`); returns `None` for `0001-01-01` |
+| `list_containers`, `inspect_container(s)`, `container_logs`, `container_stats` | Read-only commands |
+| `_summarize` → `_state/_health/_host/_config/_network_summary` | Reduce `docker inspect` to about 20 fields; env vars keep **names only** |
+| `restart/start/stop_container` → `_container_action` | Actions (120 s timeout) |
 
-**Leitura:** `server_version`, `list_containers`, `inspect_container(s)`, `container_logs` e `container_stats`.
-
-**Resumo do inspect:** `_summarize` combina `_state_summary`, `_health_summary`, `_host_summary`, `_config_summary` e `_network_summary`. Isso reduz um JSON de centenas de linhas a cerca de 20 campos úteis para diagnóstico:
-
-```json
-{
-  "name": "demo-worker", "status": "running", "exit_code": 2, "oom_killed": false,
-  "restart_count": 16, "restart_policy": "always", "memory_limit_mb": null,
-  "health": null, "last_health_checks": [], "image": "alpine:3.20",
-  "command": ["sh", "-c", "..."], "env_vars": ["PATH"], "ports": {}, "networks": ["devops-agent-demo_default"]
-}
-```
-
-**Ações:** `restart_container`, `start_container` e `stop_container`, todas via `_container_action` (timeout de 120 s).
-
-**`DockerError`** (`Exception`): qualquer falha (CLI ausente, timeout, daemon parado, container inexistente, nome inválido).
+Because the Docker CLI honors `DOCKER_HOST` and `DOCKER_CONTEXT`, the agent can watch a remote daemon.
 
 ### `tools.py`
 
-**`Tool`** (dataclass imutável): uma ferramenta que o modelo pode chamar.
-
-| Campo | Descrição |
-|---|---|
-| `name`, `description`, `params`, `required` | Viram o JSON Schema enviado ao Ollama (`schema()`) |
-| `func` | Função Python executada |
-| `needs_approval` | Se `True`, o `Agent` pede confirmação antes de executar |
-| `keep` | `"head"` ou `"tail"`: qual parte manter quando a saída passa de `max_tool_output` |
-
-`Tool.run(args)` roda em três passos:
-
-1. `_known_args` descarta parâmetros inventados e valores vazios.
-2. `_check_required` exige os parâmetros obrigatórios.
-3. `_to_text` serializa o resultado em JSON compacto.
-
-Exporta `TOOLS` (lista), `TOOLS_BY_NAME` (dict) e `TOOL_SCHEMAS` (pré-calculado). `_action_tool()` cria ferramentas de ação já com `needs_approval=True`.
-
-### `prompts.py`
-
-`SYSTEM_PROMPT` (regras, referência de exit codes e formato da resposta), `STEP_LIMIT_PROMPT`, `EVIDENCE_PROMPT`, `ACTION_DENIED` e `unknown_tool()`.
+**`Tool`** (frozen dataclass): `name`, `description`, `params`, `required`, `func`, `needs_approval` and `keep` (`"head"`/`"tail"`, the part kept when truncating). `run(args)` drops invented or empty arguments (`_known_args`), checks the required ones (`_check_required`) and serializes the result (`_to_text`).
+`_action_tool()` builds state-changing tools that always have `needs_approval=True`. The module exports `TOOLS`, `TOOLS_BY_NAME` and `TOOL_SCHEMAS`. Tool descriptions stay in English, which models follow most reliably.
 
 ### `agent.py`
 
-**`Agent`**: mantém o histórico (`messages`) e executa o loop. Veja [Loop do agente](#loop-do-agente).
+**`Agent`**: one conversation with the model. It is not thread-safe, so the system creates one per investigation.
 
-| Método | Papel |
+| Method | Role |
 |---|---|
-| `run(task, require_evidence=False)` | API pública. Se der erro ou Ctrl+C, desfaz a rodada no histórico (snapshot) |
-| `reset()` | Volta o histórico só para o system prompt |
-| `_solve` / `_step` / `_force_answer` | Loop principal, uma rodada, e a resposta forçada ao atingir `max_steps` |
-| `_demand_evidence` | Recusa uma resposta dada sem nenhuma ferramenta e pede investigação (só com `require_evidence`) |
-| `_ask_model` / `_chat_kwargs` / `_chat` | Chamada ao Ollama com fallback para modelos sem suporte a `think` |
-| `_execute` / `_approve` / `_invoke` | Busca a ferramenta, pede aprovação e executa com captura de erro |
-| `_trim_history` | Mantém o system prompt e as últimas `HISTORY_TURNS` (3) interações |
+| `run(task, require_evidence=False)` | Public API. Gives each run a `run_id`; on error or Ctrl+C it rolls the history back |
+| `reset()` | Resets the history to the system prompt of the current language |
+| `_solve` / `_step` / `_force_answer` | Main loop, one round, and the forced answer when `max_steps` is reached |
+| `_demand_evidence` | Rejects an answer given without any tool (only with `require_evidence`) |
+| `_ask_model` / `_chat_kwargs` / `_chat` | Ollama call; retries without `think` for models that don't support it |
+| `_execute` / `_approve` / `_invoke` | Tool lookup, approval, execution, **redaction** and truncation |
+| `_print` / `_audit` | Output prefixed with `[label]`; audit events carry `run` and `subject` |
+| `_trim_history` | Keeps the system prompt plus the last `HISTORY_TURNS` (3) turns |
 
-Funções de módulo: `_native_tool_calls` lê os `tool_calls` estruturados. `_text_tool_calls`, `_json_objects` e `_as_tool_call` formam o plano B para modelos que escrevem a chamada como JSON no texto.
+Module functions:
+- `_clean` removes `<think>` blocks, including reasoning that ends in a lone `</think>` (qwen3 does this).
+- `_native_tool_calls` reads structured tool calls.
+- `_text_tool_calls`, `_json_objects` and `_as_tool_call` handle models that write the call as JSON in plain text.
+
+### `workers.py`
+
+**`Investigator`**: a `queue.Queue` consumed by `size` daemon threads.
+- `submit(issue)` returns `False` when that container is already queued or under investigation.
+- `busy()` counts queued plus running investigations.
+- `wait()` polls until everything is done, so Ctrl+C still works on Windows.
+- A failure in one investigation is reported through `on_error` and never kills the worker.
 
 ### `monitor.py`
 
-**`Issue`** (dataclass imutável): `container`, `problems` (tupla de descrições), `detail` (texto unido) e `task()` (texto entregue ao agente).
+**`Issue`** (frozen dataclass) holds `container` and `problems`, plus `detail` and `task()` (translated). **`Monitor`** offers `scan()` (one `docker ps` plus one `docker inspect` for all containers) and `due(issues)` (cooldown per container). Rules live in small functions: `_state_problem`, `_health_problem`, `_restart_problem` and `_log_problem`. Log examples are redacted.
 
-**`Monitor`**: guarda estado entre varreduras (`_restart_counts`, `_alerted`).
+### `redaction.py`
 
-| Método | Papel |
-|---|---|
-| `scan()` | `docker ps -a` + um único `docker inspect` com todos os containers, depois aplica as regras |
-| `due(issues)` | Filtra pelo cooldown por container (relógio monotônico) |
-| `_check(info, now)` | Roda todas as regras e cria um `Issue` se alguma disparar |
-| `_state_problem`, `_failed_recently`, `_log_problem`, `_error_lines` | Regras que dependem da configuração do monitor |
-
-As regras sem estado (`_health_problem`, `_restart_problem`, `_started_recently`, `_oom_suffix`, `_age`) são funções de módulo.
+`redact(text)` applies the masking rules. `redact_data(value)` walks dicts and lists and hides the whole value under keys that look sensitive (`DB_PASSWORD`, `api_key`, `token`...). The replacement is always `[REDACTED]`.
 
 ### `audit.py`
 
-**`AuditLog`**: `log(event, **data)` grava uma linha JSON com `ts` (UTC) e `event`.
+**`AuditLog`**: `log(event, **data)` writes one JSON line with `ts` (UTC) and `event`. It uses a lock (safe with parallel workers), omits `None` fields and redacts every record.
 
-### `ui.py`
+### `i18n.py` and `locales/`
 
-- `console`: instância única do Rich. No Windows, reconfigura stdout/stderr com `errors="replace"` para não quebrar ao redirecionar a saída.
-- **`YesNoConfirm`** (subclasse de `rich.prompt.Confirm`): aceita `s/sim/y/yes` e `n/não/nao/no`, com padrão **n**.
-- `ask_approval(tool, args)`: o `Approver` usado pelo `Agent`. Enter, Ctrl+C ou EOF contam como **negado**.
-- `show_answer`, `show_ok`, `show_error` e `show_dim`: funções de saída.
+`t(key, **values)` returns the text in the current language and falls back to English. `detect_language()` picks the language (see [Languages](#languages)). Catalogs are plain dicts in `locales/en.py` and `locales/pt_br.py`.
 
-### `cli.py`
+### `ui.py` and `cli.py`
 
-`main()` faz o parse dos argumentos (`build_parser`), monta a configuração (`_build_config`), roda o `preflight` (Docker e modelo disponível) e despacha o comando (`_dispatch`). Retorna `1` se o preflight falhar e `0` caso contrário.
+- **`ui.py`:** `console`; **`YesNoConfirm`**, which shows `y/n` or `s/n` and accepts both; `ask_approval`, which is serialized by a lock so parallel workers take turns at the terminal; `show_answer(answer, label)`; `spinner` for chat.
+- **`cli.py`:** `main()` loads `.env`, applies `--lang`, builds the parser with translated help, runs the preflight (Docker plus the model in Ollama) and dispatches. It returns `1` when the preflight fails.
 
 ---
 
-## Ferramentas expostas ao modelo
+## Tools exposed to the model
 
-| Ferramenta | Comando Docker | Aprovação | Saída truncada mantém |
+| Tool | Docker command | Approval | Long output keeps |
 |---|---|---|---|
-| `list_containers(include_stopped?)` | `docker ps [-a] --format {{json .}}` | — | início |
-| `inspect_container(container)` | `docker inspect --type container` (resumido) | — | início |
-| `get_container_logs(container, tail?)` | `docker logs --tail N` (stdout+stderr, máx. 500 linhas) | — | **fim** |
-| `get_container_stats(container?)` | `docker stats --no-stream` | — | início |
-| `restart_container(container)` | `docker restart` | **sim** | — |
-| `start_container(container)` | `docker start` | **sim** | — |
-| `stop_container(container)` | `docker stop` | **sim** | — |
+| `list_containers(include_stopped?)` | `docker ps [-a] --format {{json .}}` | — | start |
+| `inspect_container(container)` | `docker inspect --type container` (summarized) | — | start |
+| `get_container_logs(container, tail?)` | `docker logs --tail N` (stdout+stderr, max 500 lines) | — | **end** |
+| `get_container_stats(container?)` | `docker stats --no-stream` | — | start |
+| `restart_container(container)` | `docker restart` | **yes** | — |
+| `start_container(container)` | `docker start` | **yes** | — |
+| `stop_container(container)` | `docker stop` | **yes** | — |
 
-Erros de execução voltam ao modelo como texto (`"Erro: ..."`), e não como exceção, para que ele possa se corrigir (por exemplo, quando erra o nome do container).
-
----
-
-## Regras de detecção do monitor
-
-Aplicadas a cada container por `Monitor._check`. Todas as que dispararem viram um único `Issue` por container.
-
-| Regra | Condição | Mensagem |
-|---|---|---|
-| Loop de reinício | `status == "restarting"` | `em loop de reinício (N reinícios, último exit code X)` |
-| Estado morto | `status == "dead"` | `está no estado 'dead'` |
-| Saída com erro | `status == "exited"` e (`exit_code != 0` ou `oom_killed`) e terminou há ≤ 24 h | `parou com exit code X` |
-| Healthcheck | `status == "running"` e `health == "unhealthy"` | `healthcheck falhando (N falhas seguidas)` |
-| Reinício entre varreduras | `running` e `restart_count` aumentou desde a última varredura | `reiniciou Nx desde a última verificação` |
-| Loop na primeira varredura | `running`, sem histórico, `restart_count ≥ 3` e iniciado há ≤ 5 min | `já reiniciou Nx e subiu há poucos minutos` |
-| Erros no log (`--scan-logs`) | `running` e ≥ 3 linhas casando com `ERROR_RE` na janela | `N linhas de erro nos logs...` |
-
-- Todas as regras que tratam saída ou reinício acrescentam `(OOMKilled...)` quando `oom_killed` é verdadeiro.
-- Containers parados com exit 0 são ignorados, pois são jobs que terminaram.
-- Containers parados mantêm o último status de healthcheck, por isso essa regra só vale para `running`.
-- A janela de log é `--interval` no `watch` e 300 s no `check`.
-- `ERROR_RE` casa com `ERROR`, `FATAL`, `CRITICAL`, `PANIC`, `panic:`, `Traceback (most recent call last)`, `Exception`, `level=error` e `"level":"error"`.
+Execution errors go back to the model as text (`"Error: ..."`) so it can correct itself, for example after a wrong container name.
 
 ---
 
-## Loop do agente
+## Monitor rules
 
-1. **Início:** adiciona a tarefa como mensagem `user`, corta o histórico antigo (`_trim_history`) e registra `task` no audit.
-2. **Rodada (`_step`):** chama `client.chat` com `tools=TOOL_SCHEMAS`, `temperature=0.1`, `num_ctx` e `think=False`.
-   - Se o modelo recusar o parâmetro `think`, o agente repete a chamada sem ele e lembra disso nas próximas rodadas.
-   - Remove blocos `<think>...</think>` do conteúdo.
-3. **Chamadas de ferramenta:** usa `message.tool_calls`. Se vier vazio, tenta extrair JSON `{"name": ..., "parameters": ...}` do texto (plano B para modelos pequenos). Só aceita nomes que existam em `TOOLS_BY_NAME`.
-4. **Execução (`_execute`):** ferramenta desconhecida vira mensagem de erro com a lista das válidas. Se `needs_approval`, chama o `Approver`; se for negado, devolve `ACTION_DENIED`. A saída é truncada em `max_tool_output` caracteres e volta como mensagem `role="tool"`.
-5. **Fim:** quando o modelo responde sem pedir ferramentas, essa é a resposta final (`answer` no audit).
-6. **Exigência de evidência:** no `check` e no `watch` (`require_evidence=True`), se o modelo responder sem ter chamado nenhuma ferramenta, a resposta é recusada uma vez com `EVIDENCE_PROMPT`. Isso evita que modelos pequenos inventem a saída das ferramentas.
-7. **Limite:** ao atingir `max_steps`, o agente envia `STEP_LIMIT_PROMPT` e faz uma última chamada **sem ferramentas** para obrigar a resposta.
+Every rule that fires for a container is merged into a single `Issue`.
 
-No `check` e no `watch`, cada `Issue` é investigado com histórico zerado (`reset()`). No `chat`, o histórico é mantido entre perguntas (as últimas 3 interações) e `/limpar` o zera.
-
----
-
-## Modelo de segurança
-
-| Ameaça | Mitigação |
+| Rule | Condition |
 |---|---|
-| Modelo executar comando arbitrário | Não existe ferramenta de shell. `subprocess.run` recebe lista de argumentos (sem `shell=True`) e o subcomando Docker é fixo em cada função |
-| Injeção pelo nome do container | `_name()` valida contra regex e rejeita `;`, espaços, `/` e similares |
-| Modelo alucinar uma ação destrutiva | Ações têm `needs_approval=True`. O padrão da confirmação é **n**, e EOF/Ctrl+C contam como negado |
-| *Prompt injection* via logs (um log dizendo "pare todos os containers") | O conjunto de ferramentas é limitado e toda ação exige aprovação humana |
-| Vazamento de segredos | O `inspect` resumido envia só os **nomes** das variáveis de ambiente, nunca os valores |
-| Saída enorme estourando o contexto | Truncamento por ferramenta (`keep`), `tail` limitado a 500 linhas e histórico limitado |
-| Rastreabilidade | Todo evento é registrado em `logs/audit.jsonl` |
+| Restart loop | `status == "restarting"` |
+| Dead | `status == "dead"` |
+| Failed exit | `status == "exited"` and (`exit_code != 0` or `oom_killed`) and finished ≤ 24 h ago |
+| Healthcheck | `status == "running"` and `health == "unhealthy"` |
+| Restarted between scans | `running` and `restart_count` grew since the last scan |
+| Loop on first scan | `running`, no history, `restart_count ≥ 3` and started ≤ 5 min ago |
+| Log errors (`--scan-logs`) | `running` and ≥ 3 lines matching `ERROR_RE` inside the window |
 
-> ⚠️ Os **logs** dos containers são enviados ao modelo. Com Ollama local isso não sai da máquina, mas se `OLLAMA_HOST` apontar para um servidor remoto, os logs trafegam até ele. O `audit.jsonl` guarda até 500 caracteres de cada saída de ferramenta, por isso `logs/` está no `.gitignore`.
-
----
-
-## Configuração
-
-| Variável | Campo em `Config` | Padrão | Descrição |
-|---|---|---|---|
-| `AGENT_MODEL` | `model` | `qwen3:4b` | Modelo do Ollama (o flag `--model` tem prioridade) |
-| `OLLAMA_HOST` | `ollama_host` | `http://localhost:11434` | Endereço do Ollama |
-| `AGENT_MAX_STEPS` | `max_steps` | `12` | Máximo de rodadas modelo → ferramenta por tarefa |
-| `AGENT_NUM_CTX` | `num_ctx` | `8192` | Janela de contexto pedida ao Ollama |
-| `AGENT_MAX_TOOL_OUTPUT` | `max_tool_output` | `4000` | Caracteres máximos de cada saída de ferramenta |
-| `AGENT_AUDIT_FILE` | `audit_file` | `logs/audit.jsonl` | Caminho do log de auditoria |
-
-Constantes internas: `HISTORY_TURNS=3`, `TEMPERATURE=0.1`, `AUDIT_OUTPUT_CHARS=500` (agent), `MAX_LOG_LINES=500`, `ACTION_TIMEOUT=120`, `STATS_TIMEOUT=45` (docker_tools), `LOOP_MIN_RESTARTS=3`, `RECENT_START=5min` (monitor) e `CHECK_LOG_WINDOW=300` (cli).
+- Containers that exited with code 0 are ignored, because they are finished jobs.
+- Stopped containers keep their last health status, which is why the healthcheck rule only applies to `running` ones.
+- The log window is `--interval` for `watch` and 300 s for `check`.
+- The cooldown (default 600 s) avoids alerting about the same container on every scan.
 
 ---
 
-## CLI
+## Agent loop
 
-```
-python -m devops_agent [--model MODEL] {chat,ask,check,watch} ...
-```
+1. **Start:** appends the task, trims old history and audits `task`.
+2. **Round:** calls `chat` with `tools`, `temperature=0.1`, `num_ctx` and `think=False`, then strips any reasoning from the answer.
+3. **Tool calls:** reads `message.tool_calls`. If there are none, it looks for a JSON call in the text and accepts only names that exist in `TOOLS_BY_NAME`.
+4. **Execution:**
+   - An unknown tool returns an error that lists the valid ones.
+   - An action with `needs_approval` asks the operator first; if denied, it returns "Action DENIED".
+   - The output is redacted, truncated to `max_tool_output` characters and appended as `role="tool"`.
+5. **Evidence:** for incidents (`require_evidence=True`), an answer given without any tool is rejected once.
+6. **End:** an answer without tool calls is the final answer.
+7. **Limit:** after `max_steps` rounds, the agent sends one last call **without tools** that forces an answer.
 
-| Comando | Opções | Comportamento |
+---
+
+## Parallel investigations
+
+`check` and `watch` hand every `Issue` to the `Investigator`:
+
+- **N workers** (`AGENT_WORKERS` or `--workers`, default 2) investigate different containers at the same time.
+- **The scanner keeps running** during investigations, and a container already queued or under investigation is not queued again.
+- **One `Agent` per investigation**, labeled with the container name. Terminal lines look like `[demo-api] → inspect_container(...)` and every audit event carries the same `run` id.
+- **Terminal approvals are serialized:** only one prompt at a time.
+- **Ctrl+C exits immediately:** worker threads are daemons.
+
+> More workers only help if the LLM backend serves requests in parallel. With Ollama, set `OLLAMA_NUM_PARALLEL` and use a GPU; on a CPU-only machine, requests queue inside Ollama anyway.
+
+---
+
+## Security
+
+The full policy and how to report vulnerabilities are in **[SECURITY.md](SECURITY.md)**. In short:
+
+| Threat | Mitigation |
+|---|---|
+| The model running arbitrary commands | No shell tool; fixed argument lists (`shell=False`); validated container names |
+| The model breaking something | Every action requires approval; the default answer is **no**; Enter, Ctrl+C and EOF all mean no |
+| Prompt injection through logs ("stop all containers") | A small, typed tool set, and approval for every action |
+| Secrets in logs reaching the model or disk | `redaction.py` runs on every tool output, log example and audit record |
+| Secrets in container configuration | `inspect` shows environment variable **names only** |
+| Secrets in the repository | `.env` is git-ignored; `.env.example` has names only (enforced by a test); gitleaks runs in pre-commit and in CI |
+| Secrets in the image | `.dockerignore` excludes `.env*` and `logs/`; the container runs as non-root |
+
+**Redaction** recognizes:
+- PEM private keys and `user:password@host` in URLs;
+- `Bearer`/`Basic` authorization values;
+- AWS access key IDs and GitHub, GitLab, Slack, Google, OpenAI-style and Telegram tokens;
+- JWTs;
+- `password`/`secret`/`token`/`api_key`/`access_key`/`private_key`/`credential` assignments, in `key=value`, `key: value` and JSON forms.
+
+It is a safety net, not a guarantee.
+
+---
+
+## Configuration
+
+Settings come from environment variables or from a `.env` file in the working directory. Copy `.env.example` (it holds **names only**) and fill in just what you need. Real variables always win over the file.
+
+| Variable | Default | Description |
 |---|---|---|
-| `chat` | — | REPL interativo; `/limpar` zera o histórico; `/sair` encerra |
-| `ask PERGUNTA...` | — | Uma pergunta, uma resposta |
-| `check` | `--only a,b`, `--scan-logs` | Uma varredura; investiga cada `Issue` e sai |
-| `watch` | `--only`, `--scan-logs`, `--interval 30`, `--cooldown 600` | Varredura contínua; alerta o mesmo container no máximo uma vez por `cooldown` segundos |
+| `AGENT_MODEL` | `qwen3:4b` | Ollama model |
+| `AGENT_LANGUAGE` | system language | `en` or `pt-BR` |
+| `AGENT_WORKERS` | `2` | Parallel investigations |
+| `AGENT_MAX_STEPS` | `12` | Max model → tool rounds per task |
+| `AGENT_NUM_CTX` | `8192` | Context window requested from Ollama |
+| `AGENT_MAX_TOOL_OUTPUT` | `4000` | Max characters of each tool output |
+| `AGENT_AUDIT_FILE` | `logs/audit.jsonl` | Audit log path (relative to the working directory) |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server |
+| `DOCKER_HOST` / `DOCKER_CONTEXT` | Docker defaults | Which daemon to watch |
+| `AGENT_ENV_FILE` | `.env` | Location of the env file (set it in the real environment) |
 
-Antes de qualquer comando, o **preflight** confere `docker version` e `ollama show <modelo>`. Se algo falhar, mostra como resolver e sai com código 1.
+### CLI
+
+```
+devops-agent [--model MODEL] [--lang en|pt-BR] {chat,ask,check,watch} ...
+```
+
+| Command | Options | Behavior |
+|---|---|---|
+| `chat` | — | Interactive REPL; `/clear` (or `/limpar`) resets it; `/exit` (or `/sair`) quits |
+| `ask QUESTION...` | — | One question, one answer |
+| `check` | `--only a,b`, `--scan-logs`, `--workers N` | One scan; investigates every issue in parallel, waits and exits |
+| `watch` | the same, plus `--interval 30` and `--cooldown 600` | Continuous scanning; prints a status line only when something changes |
+
+`--model` and `--lang` go **before** the command. Before any command, the preflight checks `docker version` and `ollama show <model>`.
 
 ---
 
-## Log de auditoria
+## Languages
 
-Formato JSON Lines, um evento por linha:
+The agent's answers, the system prompt, CLI messages, monitor messages and `--help` are translated. Tool descriptions stay in English on purpose.
 
-| `event` | Campos |
+The language is chosen in this order:
+1. `--lang`
+2. `AGENT_LANGUAGE`
+3. the OS locale
+4. the `LANG`/`LC_*` variables
+5. English
+
+The OS locale comes before `LANG` because tools like Git for Windows export `LANG=en_US` even on Portuguese systems.
+
+**To add a language:**
+1. Copy `devops_agent/locales/en.py` and translate the values, keeping every `{placeholder}`.
+2. Register the new catalog in `i18n.CATALOGS` and map its codes in `i18n.normalize`.
+3. Run `pytest tests/test_i18n.py`. It fails if keys or placeholders differ, if code uses a missing key, or if a key is never used.
+
+---
+
+## Running in Docker
+
+```bash
+docker build -t devops-agent .
+
+docker run -it --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+  --add-host=host.docker.internal:host-gateway \
+  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  -e AGENT_LANGUAGE=en \
+  -v devops-agent-data:/data \
+  devops-agent watch --scan-logs
+```
+
+- `-it` is required because approvals are asked in the terminal.
+- The image runs as the non-root user `agent` (UID 10001). `--group-add` gives it access to the socket on Linux. On Docker Desktop, if you get *permission denied* on the socket, use `--group-add 0` (the socket belongs to `root` there).
+- ⚠️ Mounting the Docker socket is equivalent to root on the host. Prefer a remote `DOCKER_HOST` with TLS, or a socket proxy that only allows `ps`, `inspect`, `logs`, `stats`, `start`, `stop` and `restart`.
+- The audit log goes to the `/data` volume.
+
+---
+
+## Audit log
+
+JSON Lines format, one event per line. Every event has `ts`, `event`, `run` (a unique id for each task) and `subject` (the container being investigated, when there is one).
+
+| `event` | Extra fields |
 |---|---|
 | `task` | `task`, `model` |
-| `tool` | `tool`, `args`, `ok`, `output` (primeiros 500 caracteres) |
+| `tool` | `tool`, `args`, `ok`, `output` (first 500 characters, redacted) |
 | `approval` | `tool`, `args`, `approved` |
 | `answer` | `answer` |
 
 ```json
-{"ts": "2026-10-23T19:31:02+00:00", "event": "task", "task": "O monitor detectou um problema no container 'demo-api'...", "model": "qwen3:4b"}
-{"ts": "2026-10-23T19:31:20+00:00", "event": "tool", "tool": "get_container_logs", "args": {"container": "demo-api"}, "ok": true, "output": "Iniciando API na porta 3000...\nERROR: could not connect to database..."}
-{"ts": "2026-10-23T19:31:41+00:00", "event": "approval", "tool": "restart_container", "args": {"container": "demo-api"}, "approved": false}
-```
-
-Consulta rápida no PowerShell:
-
-```powershell
-Get-Content logs\audit.jsonl | ConvertFrom-Json | Where-Object event -eq approval
+{"ts": "2026-10-23T19:31:02+00:00", "event": "task", "run": "3f9c2e1a", "subject": "demo-api", "task": "The monitor detected a problem in container 'demo-api'...", "model": "qwen3:4b"}
+{"ts": "2026-10-23T19:31:20+00:00", "event": "tool", "run": "3f9c2e1a", "subject": "demo-api", "tool": "get_container_logs", "args": {"container": "demo-api"}, "ok": true, "output": "Starting API on port 3000...\nERROR: could not connect to database..."}
+{"ts": "2026-10-23T19:31:41+00:00", "event": "approval", "run": "3f9c2e1a", "subject": "demo-api", "tool": "restart_container", "args": {"container": "demo-api"}, "approved": false}
 ```
 
 ---
 
-## Testes
+## Testing
 
-```powershell
-.\.venv\Scripts\pip install -r requirements-dev.txt
-.\.venv\Scripts\python -m pytest                       # tudo (cerca de 8 s)
-.\.venv\Scripts\python -m pytest -m "not integration"  # sem tocar no Docker
-.\.venv\Scripts\python -m pytest tests/test_agent.py -k evidence
+```bash
+pip install -e ".[dev]"
+pytest                          # everything
+pytest -m "not integration"     # without touching Docker (what CI runs)
+pytest tests/test_redaction.py -v
 ```
 
-Os testes de unidade **não precisam de Docker nem de Ollama rodando**. O modelo e o Docker são substituídos por dublês:
+Unit tests need **neither Docker nor Ollama**: both are replaced by test doubles.
 
-| Dublê | Onde | O que substitui |
+| Double | Where | Replaces |
 |---|---|---|
-| `FakeClient` | `tests/conftest.py` | `ollama.Client`: devolve respostas roteirizadas (texto, `tool_calls` ou exceção) e registra cada chamada |
-| `assistant(content, calls)` | `tests/conftest.py` | Monta um `ollama.Message` do modelo, com ou sem chamadas de ferramenta |
-| `make_info(**campos)` | `tests/conftest.py` | O dicionário de `docker_tools._summarize`, já com valores de um container saudável |
-| `fake_tools` | `tests/test_agent.py` | `TOOLS_BY_NAME` com ferramentas falsas (leitura, ação com aprovação, ferramenta que falha) |
-| `docker_calls` | `tests/test_docker_tools.py` | `docker_tools._run`: registra o comando montado sem executá-lo |
-| `fake_docker` | `tests/test_monitor.py` | `list_containers` e `inspect_containers` para testar o `Monitor.scan()` |
+| `FakeClient`, `assistant()` | `tests/conftest.py` | `ollama.Client` and model messages (text, `tool_calls` or exceptions) |
+| `make_info()` | `tests/conftest.py` | The `docker_tools._summarize` dict, healthy by default |
+| `english` (autouse) | `tests/conftest.py` | Pins the language to English and resets it after each test |
+| `fake_tools` | `tests/test_agent.py` | `TOOLS_BY_NAME`: a read tool, an action, a failing tool and a tool that leaks a secret |
+| `docker_calls` | `tests/test_docker_tools.py` | `docker_tools._run`: records the command without running it |
+| `fake_docker` | `tests/test_monitor.py` | `list_containers` / `inspect_containers` |
+| `FakeInvestigator`, `FakeAgent` | `tests/test_cli.py` | The queue and the agent, for testing commands |
 
-| Arquivo | Cobre |
+| File | Covers |
 |---|---|
-| `test_docker_tools.py` | Validação de nomes (injeção), datas do Docker, resumo do `inspect` (inclusive que **valores de env nunca aparecem**), erros do `subprocess`, comandos montados |
-| `test_tools.py` | `Tool.run` (filtragem e validação de argumentos), schema do Ollama, **só ações exigem aprovação** |
-| `test_monitor.py` | Cada regra de detecção, `ERROR_RE`, filtro `--only`, memória de reinícios entre varreduras, cooldown |
-| `test_agent.py` | Loop completo, plano B de JSON no texto, aprovação negada/concedida, erros de ferramenta, limite de passos, exigência de evidência, fallback do `think`, rollback do histórico, auditoria |
-| `test_cli.py` | Argumentos, preflight, `check`, investigação de `Issue` com `require_evidence`, comandos do chat, `YesNoConfirm` |
-| `test_audit.py` | Formato JSON Lines |
-| `test_docker_integration.py` | Leitura contra o Docker real (marcado `integration`, pulado se o Docker estiver parado) |
+| `test_agent.py` | Loop, JSON-in-text fallback, approvals, errors, step limit, evidence, `think` fallback, reasoning without an opening tag, history rollback, redaction, labels, `run` id |
+| `test_workers.py` | Real parallelism (a barrier only passes if two run at once), no duplicates per container, failure isolation |
+| `test_redaction.py` | Every secret format, normal lines left untouched, idempotency, nested data |
+| `test_config.py` | `.env` parsing, real environment wins, empty values, **`.env.example` holds names only** |
+| `test_i18n.py` | Same keys and placeholders in every language, no missing or unused keys, language detection |
+| `test_monitor.py` | Every rule, `ERROR_RE`, `--only`, restart memory, cooldown, redacted log examples |
+| `test_docker_tools.py` | Injection rejected, inspect summary (env values never exposed), subprocess errors, built commands |
+| `test_tools.py` | `Tool.run`, schema, **only actions need approval** |
+| `test_cli.py` | Arguments, `--lang`, preflight, `check`/`watch` with the queue, heartbeat, chat, `YesNoConfirm` |
+| `test_audit.py` | Format, redaction, 8 threads writing at the same time |
+| `test_docker_integration.py` | Read-only checks against the real daemon (marked `integration`) |
 
-**Teste de mutação manual:** ao remover propositalmente cada regra de segurança (aprovação, validação de nome, ocultação de env, filtro de healthcheck em containers parados, exigência de evidência), pelo menos um teste falha.
+**CI** (`.github/workflows/ci.yml`) runs on every push and pull request:
+- unit tests on Python 3.10, 3.11, 3.12 and 3.13;
+- gitleaks over the whole git history;
+- a Docker image build with a smoke test.
 
 ---
 
-## Ambiente de teste
+## Demo environment
 
-`demo/docker-compose.yml` sobe quatro containers com defeitos conhecidos:
+`demo/docker-compose.yml` starts four containers with known defects:
 
-| Container | Defeito | Regra que dispara | Conclusão esperada do agente |
+| Container | Defect | Rule | Expected conclusion |
 |---|---|---|---|
-| `demo-web` | nenhum | — | (não alerta) |
-| `demo-web-unhealthy` | healthcheck na porta 8081, nginx na 80 | Healthcheck | O problema está no healthcheck, não no nginx |
-| `demo-api` | Postgres inexistente | Saída com erro (exit 1) | Reiniciar não resolve; falta o banco |
-| `demo-worker` | falta `QUEUE_URL`, `restart: always` | Loop de reinício (exit 2) | Configurar a variável de ambiente |
+| `demo-web` | none | — | (no alert) |
+| `demo-web-unhealthy` | healthcheck probes port 8081, nginx listens on 80 | Healthcheck | The healthcheck is wrong, not nginx |
+| `demo-api` | Postgres does not exist | Failed exit (1) | Restarting won't help; the database is missing |
+| `demo-worker` | `QUEUE_URL` missing, `restart: always` | Restart loop (2) | Set the environment variable |
 
-```powershell
+```bash
 docker compose -f demo/docker-compose.yml up -d
-.\.venv\Scripts\python -m devops_agent check
+devops-agent check
 docker compose -f demo/docker-compose.yml down
 ```
 
 ---
 
-## Como estender
+## Extending
 
-### Nova ferramenta de leitura
-
-1. Função em `docker_tools.py`:
-
-   ```python
-   def disk_usage() -> list[dict]:
-       return _json_lines(_run(["system", "df", "--format", "{{json .}}"]))
-   ```
-
-2. Registro em `TOOLS` (`tools.py`):
-
-   ```python
-   Tool(
-       name="get_disk_usage",
-       description="Uso de disco do Docker: imagens, containers, volumes e cache de build.",
-       params={},
-       required=(),
-       func=dk.disk_usage,
-   ),
-   ```
-
-3. Se fizer sentido, cite a ferramenta na regra 1 do `SYSTEM_PROMPT`.
-
-### Nova ação (altera estado)
-
-Use sempre `_action_tool`, que já aplica `needs_approval=True`:
+**A read-only tool:** add a function to `docker_tools.py`, then register it in `TOOLS`:
 
 ```python
-_action_tool("pause_container", "Pausa um container.", dk.pause_container),
+def disk_usage() -> list[dict]:
+    return _json_lines(_run(["system", "df", "--format", "{{json .}}"]))
 ```
 
-### Nova regra de detecção
+```python
+Tool(
+    name="get_disk_usage",
+    description="Docker disk usage: images, containers, volumes and build cache.",
+    params={},
+    required=(),
+    func=dk.disk_usage,
+),
+```
 
-Crie uma função `_minha_regra(info) -> str | None` em `monitor.py` (ou um método, se depender da configuração do `Monitor`) e acrescente-a na tupla `found` de `Monitor._check`. `info` é o dicionário retornado por `docker_tools._summarize`.
+**An action** must always go through `_action_tool`, which enforces approval:
 
-### Outra interface (Telegram, Discord, web)
+```python
+_action_tool("pause_container", "Pauses a container.", dk.pause_container),
+```
 
-O `Agent` não depende do terminal para aprovação: ele recebe um `Approver = Callable[[Tool, dict], bool]`. Basta implementar outro aprovador, por exemplo um botão no Telegram, e outra função para exibir respostas.
+**A detection rule:** write a `_my_rule(info) -> str | None` function in `monitor.py` (or a method, if it depends on monitor settings), add its text to both catalogs and append it to the `found` tuple in `Monitor._check`.
+
+**Another approval channel** (Slack, Telegram, webhook): `Agent` receives an `Approver = Callable[[Tool, dict], bool]`, so it is enough to implement one, keeping "no answer means no".
 
 ---
 
-## Convenções de código
+## Choosing a model
 
-- **Código em inglês:** classes, funções, variáveis e constantes. Textos para o usuário e para o modelo ficam em português.
-- **Funções pequenas e com uma responsabilidade:** média de cerca de 5 linhas. Funções longas são quebradas em auxiliares com nome descritivo (ex.: `_solve → _start / _step / _force_answer`).
-- **Prefixo `_`** para tudo que é interno ao módulo.
-- **Constantes** em `UPPER_CASE` no topo do módulo, em vez de números mágicos.
-- **Erros esperados** viram valores, não exceções, quando o modelo precisa reagir a eles (resultado de ferramenta, ação negada).
-- **Sem dependências desnecessárias:** Docker via CLI em vez do SDK, `argparse` em vez de frameworks de CLI.
+Results on the demo environment, on a CPU-only machine:
+
+| Model | `demo-web-unhealthy` | Notes |
+|---|---|---|
+| `llama3.2:3b` | ❌ Invented an "OOMKilled"; in another run it fabricated a whole `docker inspect` output | Fast, but unreliable with tools (which led to `require_evidence`) |
+| `qwen3:4b` (default) | ✅ Found that the healthcheck probes port 8081 while nginx listens on 80, and that restarting won't help | Much better reasoning; it reasons even with `think=False`, and `_clean` strips that reasoning |
+
+On a CPU, expect minutes per investigation. With a GPU, larger models (such as `qwen3:8b` and up) and more workers pay off.
 
 ---
 
-## Limitações conhecidas
+## Code conventions
 
-- **Velocidade em CPU:** nesta máquina (16 GB de RAM, sem GPU dedicada), um diagnóstico com `llama3.2:3b` levou de 60 a 70 s. O `qwen3:8b` é mais preciso e cerca de 2x mais lento.
-- **Alucinação:** modelos pequenos às vezes inventam detalhes. Nos testes, o `llama3.2:3b` citou uma variável `POSTGRES_HOST` inexistente e, em outro caso, escreveu uma saída de `docker inspect` falsa sem chamar a ferramenta (o que levou à criação de `require_evidence`). A aprovação humana existe por isso.
-- **`watch` é sequencial:** enquanto o agente investiga ou espera aprovação, não há novas varreduras. Sem ninguém no terminal, ele fica parado no prompt de aprovação.
-- **Histórico cortado por interações, não por tokens:** poucas interações com logs grandes ainda podem passar de `num_ctx`.
-- **Estado só em memória:** cooldown e contagem de reinícios são perdidos quando o processo reinicia.
-- **Escopo:** apenas o Docker do contexto padrão; sem Kubernetes ou CI/CD por enquanto.
-- **Detecção de erros no log:** `ERROR_RE` não pega `Error:` com só a primeira letra maiúscula (comum em Node.js) nem exceções com nome composto, como `RuntimeException` e `NullPointerException`.
+- **English code:** classes, functions, variables and comments. Texts for operators and for the model go through `t()` and live in `locales/`.
+- **Small, single-purpose functions** (about 5 lines on average). Long functions are split into well-named helpers (`_solve → _start / _step / _force_answer`).
+- **The `_` prefix** marks anything internal to a module, and **constants** are `UPPER_CASE` at the top of the module.
+- **Expected errors become values** when the model has to react to them (tool errors, denied actions).
+- **Few dependencies:** Docker through its CLI instead of an SDK, `argparse` and `.env` parsing without extra libraries.
+
+---
+
+## Known limitations
+
+- **Speed on a CPU:** an investigation can take minutes.
+- **Hallucinations:** small models still invent details, which is why actions need approval and incidents need evidence.
+- **Terminal approvals:** they wait indefinitely, so an unattended `watch` that needs an approval keeps that investigation on hold. Chat or webhook approvals with a timeout are on the roadmap.
+- **In-memory state:** the queue, cooldown and restart counters live in one process and are lost on restart.
+- **History is trimmed by turns, not tokens:** a few turns with large logs can still exceed `num_ctx`.
+- **Log errors:** `ERROR_RE` misses `Error:` written in title case (common in Node.js) and compound exception names such as `RuntimeException`.
+- **Redaction is regex-based:** custom secret formats may get through.
+- **Docker only:** there is no Kubernetes support yet.
 
 ---
 
 ## Roadmap
 
-- [x] Testes com `pytest`
-- [ ] Ampliar `ERROR_RE` (`Error:`, `*Exception`)
-- [ ] Ferramentas: `docker compose`, `docker system df`, limpeza de imagens (com aprovação)
-- [ ] Aprovação e alertas pelo Telegram/Discord (novo `Approver`)
-- [ ] Memória de incidentes com embeddings (`bge-m3`) para lembrar soluções anteriores
-- [ ] Kubernetes (`kubectl`) e análise de falhas de CI/CD
-- [ ] Persistir estado do monitor entre reinícios
+- [x] Test suite (pytest) and CI
+- [x] Public-repository security: redaction, `.env` with names only, gitleaks, `SECURITY.md`
+- [x] English and Brazilian Portuguese
+- [x] Installable package (`devops-agent`) and Docker image
+- [x] Parallel investigations (queue + workers)
+- [ ] Wider `ERROR_RE` (`Error:`, `*Exception`)
+- [ ] Config file and per-tool policies (allow / approve / deny)
+- [ ] LLM providers: any OpenAI-compatible API (vLLM, LM Studio...)
+- [ ] Persistent state (SQLite, then Postgres) and a distributed queue (Redis) for multiple instances
+- [ ] Approval channels with timeouts: webhook, Slack, Telegram
+- [ ] Multiple Docker hosts
+- [ ] Kubernetes
+- [ ] `/health`, Prometheus metrics and an HTTP API
+- [ ] Plugins (tools, rules, channels)
+- [ ] Incident memory with embeddings
+- [ ] More Docker tools: compose, disk usage, image cleanup
+
+---
+
+## Contributing
+
+```bash
+pip install -e ".[dev]"
+pre-commit install          # scans every commit for secrets (gitleaks)
+pytest
+```
+
+- Keep functions small and code in English.
+- Put every new text in **both** catalogs.
+- Never commit real values: use `.env`, which is git-ignored.
+- Report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
