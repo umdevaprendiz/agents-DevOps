@@ -12,6 +12,8 @@ from . import docker_tools as dk
 ERROR_RE = re.compile(
     r"\b(ERROR|FATAL|CRITICAL|PANIC)\b|panic:|Traceback \(most recent call last\)|\bException\b|level=error|\"level\":\s*\"error\""
 )
+LOOP_MIN_RESTARTS = 3
+RECENT_START = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -24,11 +26,49 @@ class Issue:
         return "; ".join(self.problems)
 
     def task(self) -> str:
+        """Texto da tarefa entregue ao agente."""
         return (
             f"O monitor detectou um problema no container '{self.container}': {self.detail}. "
             "Investigue a causa (inspect, logs, stats) e, se uma ação puder resolver, proponha-a."
         )
 
+
+# --- funções auxiliares ---------------------------------------------------------
+
+def _oom_suffix(info: dict) -> str:
+    return " (OOMKilled: morto por falta de memória)" if info["oom_killed"] else ""
+
+
+def _age(timestamp: str | None, now: datetime) -> timedelta | None:
+    moment = dk.parse_docker_time(timestamp)
+    return now - moment if moment else None
+
+
+def _started_recently(info: dict, now: datetime) -> bool:
+    age = _age(info["started_at"], now)
+    return age is not None and age <= RECENT_START
+
+
+def _health_problem(info: dict) -> str | None:
+    # Containers parados guardam o último status do healthcheck, então só vale para os que estão rodando.
+    if info["status"] == "running" and info["health"] == "unhealthy":
+        return f"healthcheck falhando ({info['health_failing_streak']} falhas seguidas)"
+    return None
+
+
+def _restart_problem(info: dict, previous: int | None, now: datetime) -> str | None:
+    if info["status"] != "running":
+        return None
+    count = info["restart_count"]
+    if previous is not None and count > previous:
+        return f"reiniciou {count - previous}x desde a última verificação{_oom_suffix(info)}"
+    if previous is None and count >= LOOP_MIN_RESTARTS and _started_recently(info, now):
+        # Primeira verificação: muitos reinícios e acabou de subir = provável loop.
+        return f"já reiniciou {count}x e subiu há poucos minutos (possível loop){_oom_suffix(info)}"
+    return None
+
+
+# --- monitor --------------------------------------------------------------------
 
 class Monitor:
     def __init__(
@@ -51,65 +91,71 @@ class Monitor:
 
     def scan(self) -> list[Issue]:
         """Retorna todos os containers com problema neste momento."""
-        names = [c["name"] for c in dk.list_containers(True) if not self.only or c["name"] in self.only]
         now = datetime.now(timezone.utc)
-        issues = []
-        for info in dk.inspect_containers(names):
-            problems = self._problems(info, now)
-            if problems:
-                issues.append(Issue(info["name"], tuple(problems)))
-        return issues
+        infos = dk.inspect_containers(self._watched_names())
+        return [issue for info in infos if (issue := self._check(info, now))]
 
     def due(self, issues: list[Issue]) -> list[Issue]:
         """Filtra os problemas que ainda não foram alertados dentro do cooldown."""
         now = time.monotonic()
-        fresh = []
-        for issue in issues:
-            last = self._alerted.get(issue.container)
-            if last is None or now - last >= self.cooldown:
-                self._alerted[issue.container] = now
-                fresh.append(issue)
+        fresh = [issue for issue in issues if self._is_due(issue.container, now)]
+        for issue in fresh:
+            self._alerted[issue.container] = now
         return fresh
 
-    def _problems(self, info: dict, now: datetime) -> list[str]:
-        name, status = info["name"], info["status"]
-        oom = " (OOMKilled: morto por falta de memória)" if info["oom_killed"] else ""
-        problems = []
+    def _watched_names(self) -> list[str]:
+        names = [c["name"] for c in dk.list_containers(True)]
+        return [name for name in names if not self.only or name in self.only]
 
+    def _is_due(self, container: str, now: float) -> bool:
+        last = self._alerted.get(container)
+        return last is None or now - last >= self.cooldown
+
+    def _check(self, info: dict, now: datetime) -> Issue | None:
+        previous = self._remember_restarts(info)
+        found = (
+            self._state_problem(info, now),
+            _health_problem(info),
+            _restart_problem(info, previous, now),
+            self._log_problem(info),
+        )
+        problems = tuple(p for p in found if p)
+        return Issue(info["name"], problems) if problems else None
+
+    def _remember_restarts(self, info: dict) -> int | None:
+        """Guarda o restart_count atual e devolve o da varredura anterior."""
+        previous = self._restart_counts.get(info["name"])
+        self._restart_counts[info["name"]] = info["restart_count"]
+        return previous
+
+    # --- regras que dependem da configuração do monitor ---
+
+    def _state_problem(self, info: dict, now: datetime) -> str | None:
+        status = info["status"]
         if status == "restarting":
-            problems.append(
-                f"em loop de reinício ({info['restart_count']} reinícios, último exit code {info['exit_code']}){oom}"
+            return (
+                f"em loop de reinício ({info['restart_count']} reinícios, "
+                f"último exit code {info['exit_code']}){_oom_suffix(info)}"
             )
-        elif status == "exited" and (info["exit_code"] != 0 or info["oom_killed"]):
-            finished = dk.parse_docker_time(info["finished_at"])
-            if finished is None or now - finished <= self.ignore_exited_older_than:
-                problems.append(f"parou com exit code {info['exit_code']}{oom}")
-        elif status == "dead":
-            problems.append("está no estado 'dead'")
+        if status == "dead":
+            return "está no estado 'dead'"
+        if status == "exited" and self._failed_recently(info, now):
+            return f"parou com exit code {info['exit_code']}{_oom_suffix(info)}"
+        return None
 
-        # Containers parados guardam o último status do healthcheck, então só vale para os que estão rodando.
-        if status == "running" and info["health"] == "unhealthy":
-            problems.append(f"healthcheck falhando ({info['health_failing_streak']} falhas seguidas)")
+    def _failed_recently(self, info: dict, now: datetime) -> bool:
+        failed = info["exit_code"] != 0 or info["oom_killed"]
+        age = _age(info["finished_at"], now)
+        return failed and (age is None or age <= self.ignore_exited_older_than)
 
-        previous = self._restart_counts.get(name)
-        self._restart_counts[name] = info["restart_count"]
-        if status == "running":
-            if previous is not None and info["restart_count"] > previous:
-                problems.append(f"reiniciou {info['restart_count'] - previous}x desde a última verificação{oom}")
-            elif previous is None and info["restart_count"] >= 3 and self._recently_started(info, now):
-                # Primeira verificação: muitos reinícios e acabou de subir = provável loop.
-                problems.append(f"já reiniciou {info['restart_count']}x e subiu há poucos minutos (possível loop){oom}")
+    def _log_problem(self, info: dict) -> str | None:
+        if not self.scan_logs or info["status"] != "running":
+            return None
+        errors = self._error_lines(info["name"])
+        if len(errors) < self.log_threshold:
+            return None
+        return f"{len(errors)} linhas de erro nos logs nos últimos {self.log_window}s, ex.: {errors[-1][:200]}"
 
-        if self.scan_logs and status == "running":
-            logs = dk.container_logs(name, tail=500, since=f"{self.log_window}s")
-            errors = [line for line in logs.splitlines() if ERROR_RE.search(line)]
-            if len(errors) >= self.log_threshold:
-                problems.append(
-                    f"{len(errors)} linhas de erro nos logs nos últimos {self.log_window}s, ex.: {errors[-1][:200]}"
-                )
-        return problems
-
-    @staticmethod
-    def _recently_started(info: dict, now: datetime, window: timedelta = timedelta(minutes=5)) -> bool:
-        started = dk.parse_docker_time(info["started_at"])
-        return started is not None and now - started <= window
+    def _error_lines(self, container: str) -> list[str]:
+        logs = dk.container_logs(container, tail=dk.MAX_LOG_LINES, since=f"{self.log_window}s")
+        return [line for line in logs.splitlines() if ERROR_RE.search(line)]

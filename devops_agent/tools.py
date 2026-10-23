@@ -1,7 +1,7 @@
 """Ferramentas que o modelo pode chamar.
 
 Para dar um novo poder ao agente, adicione um Tool em TOOLS.
-Qualquer ferramenta que altere algo deve ter needs_approval=True.
+Qualquer ferramenta que altere algo deve ser criada com _action_tool (exige aprovação).
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ class Tool:
     keep: str = "head"  # parte mantida se a saída for grande demais ("head" ou "tail")
 
     def schema(self) -> dict:
+        """Formato de ferramenta aceito pela API de chat do Ollama."""
         return {
             "type": "function",
             "function": {
@@ -33,72 +34,77 @@ class Tool:
         }
 
     def run(self, args: dict) -> str:
-        # Ignora parâmetros que o modelo inventou e confere os obrigatórios.
-        kwargs = {k: v for k, v in (args or {}).items() if k in self.params and v not in (None, "")}
-        missing = [r for r in self.required if r not in kwargs]
+        kwargs = self._known_args(args)
+        self._check_required(kwargs)
+        return _to_text(self.func(**kwargs))
+
+    def _known_args(self, args: dict | None) -> dict:
+        """Ignora parâmetros que o modelo inventou e valores vazios."""
+        return {k: v for k, v in (args or {}).items() if k in self.params and v not in (None, "")}
+
+    def _check_required(self, kwargs: dict) -> None:
+        missing = [name for name in self.required if name not in kwargs]
         if missing:
             raise ValueError(f"faltam parâmetros: {', '.join(missing)}")
-        result = self.func(**kwargs)
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+
+
+def _to_text(result: Any) -> str:
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 
 CONTAINER = {"type": "string", "description": "Nome do container, como aparece em list_containers"}
 
+
+def _action_tool(name: str, description: str, func: Callable[[str], str]) -> Tool:
+    """Ferramenta que altera um container: sempre exige aprovação humana."""
+    return Tool(
+        name=name,
+        description=f"{description} Exige aprovação humana.",
+        params={"container": CONTAINER},
+        required=("container",),
+        func=func,
+        needs_approval=True,
+    )
+
+
 TOOLS: list[Tool] = [
     Tool(
-        "list_containers",
-        "Lista os containers Docker com estado (running, exited, restarting...) e status.",
-        {"include_stopped": {"type": "boolean", "description": "Incluir containers parados (padrão: true)"}},
-        (),
-        dk.list_containers,
+        name="list_containers",
+        description="Lista os containers Docker com estado (running, exited, restarting...) e status.",
+        params={"include_stopped": {"type": "boolean", "description": "Incluir containers parados (padrão: true)"}},
+        required=(),
+        func=dk.list_containers,
     ),
     Tool(
-        "inspect_container",
-        "Detalhes de um container: exit code, OOMKilled, healthcheck, política de restart, "
+        name="inspect_container",
+        description="Detalhes de um container: exit code, OOMKilled, healthcheck, política de restart, "
         "limite de memória, portas e nomes das variáveis de ambiente.",
-        {"container": CONTAINER},
-        ("container",),
-        dk.inspect_container,
+        params={"container": CONTAINER},
+        required=("container",),
+        func=dk.inspect_container,
     ),
     Tool(
-        "get_container_logs",
-        "Últimas linhas de log (stdout e stderr) de um container.",
-        {"container": CONTAINER, "tail": {"type": "integer", "description": "Quantidade de linhas (padrão 80, máx. 500)"}},
-        ("container",),
-        dk.container_logs,
+        name="get_container_logs",
+        description="Últimas linhas de log (stdout e stderr) de um container.",
+        params={
+            "container": CONTAINER,
+            "tail": {"type": "integer", "description": "Quantidade de linhas (padrão 80, máx. 500)"},
+        },
+        required=("container",),
+        func=dk.container_logs,
         keep="tail",
     ),
     Tool(
-        "get_container_stats",
-        "Uso atual de CPU, memória, rede e disco. Sem 'container', mostra todos os que estão rodando.",
-        {"container": CONTAINER},
-        (),
-        dk.container_stats,
+        name="get_container_stats",
+        description="Uso atual de CPU, memória, rede e disco. Sem 'container', mostra todos os que estão rodando.",
+        params={"container": CONTAINER},
+        required=(),
+        func=dk.container_stats,
     ),
-    Tool(
-        "restart_container",
-        "Reinicia um container. Exige aprovação humana.",
-        {"container": CONTAINER},
-        ("container",),
-        dk.restart_container,
-        needs_approval=True,
-    ),
-    Tool(
-        "start_container",
-        "Inicia um container parado. Exige aprovação humana.",
-        {"container": CONTAINER},
-        ("container",),
-        dk.start_container,
-        needs_approval=True,
-    ),
-    Tool(
-        "stop_container",
-        "Para um container em execução. Exige aprovação humana.",
-        {"container": CONTAINER},
-        ("container",),
-        dk.stop_container,
-        needs_approval=True,
-    ),
+    _action_tool("restart_container", "Reinicia um container.", dk.restart_container),
+    _action_tool("start_container", "Inicia um container parado.", dk.start_container),
+    _action_tool("stop_container", "Para um container em execução.", dk.stop_container),
 ]
 
-TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
+TOOL_SCHEMAS = [tool.schema() for tool in TOOLS]
