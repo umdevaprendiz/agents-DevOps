@@ -78,6 +78,12 @@ def show_answer(answer: str, label: str | None = None) -> None:
     console.print(Panel(Markdown(text), title=title, border_style="blue"))
 
 
+def show_brief(brief: str, model: str, label: str | None = None) -> None:
+    """The investigation report written by the fast model, shown before the final answer."""
+    title = t("team.brief_title", model=escape(model)) + (f" · {escape(label)}" if label else "")
+    console.print(Panel(Markdown(_hard_line_breaks(brief or t("ui.no_answer"))), title=title, border_style="dim"))
+
+
 def _hard_line_breaks(text: str) -> str:
     """In Markdown a single line break becomes a space; '  \\n' keeps the break the model meant."""
     return text.replace("\n", "  \n")

@@ -125,6 +125,14 @@ class Workspace:
         """Every visible file matching a glob (on the full path or on the file name)."""
         return [path for path in self._files() if _matches_glob(path, pattern)]
 
+    def text(self, path: str) -> str:
+        """Whole content of a project text file (same limits as read_file)."""
+        return self._read_text(self.resolve(path), path)
+
+    def secret_files(self) -> list[str]:
+        """Names of secret files on disk (.env, keys...). They are listed, never read."""
+        return sorted(path for path in self._walk() if is_secret(PurePosixPath(path).name))
+
     def log_files(self) -> list[str]:
         """Log files anywhere in the project, including git-ignored ones (logs usually are)."""
         found = [path for path in self._walk() if any(_matches_glob(path, p) for p in LOG_PATTERNS)]
@@ -176,4 +184,5 @@ class Workspace:
 
 
 def _matches_glob(path: str, pattern: str) -> bool:
-    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(PurePosixPath(path).name, pattern)
+    # Case-sensitive on every OS: on Windows "dockerfile.py" must not match "Dockerfile.*".
+    return fnmatch.fnmatchcase(path, pattern) or fnmatch.fnmatchcase(PurePosixPath(path).name, pattern)

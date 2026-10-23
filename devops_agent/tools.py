@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from . import diagnostics
 from . import docker_tools as dk
+from . import security
 from .i18n import t
 from .proposals import ProposalStore
 from .workspace import Workspace
@@ -29,6 +30,11 @@ class Tool:
     func: Callable[..., Any]
     needs_approval: bool = False
     keep: str = "head"  # part kept when the output is too long: "head" or "tail"
+    writes: bool = False  # creates or changes something (proposals); never given to the analyst
+
+    @property
+    def read_only(self) -> bool:
+        return not (self.needs_approval or self.writes)
 
     def schema(self) -> dict:
         """Tool format accepted by the Ollama chat API."""
@@ -65,6 +71,10 @@ class Toolbox:
 
     def get(self, name: str) -> Tool | None:
         return self.by_name.get(name)
+
+    def read_only(self) -> Toolbox:
+        """Only the tools that read: no proposals, no container actions (for the analyst model)."""
+        return Toolbox([tool for tool in self.by_name.values() if tool.read_only])
 
     def names(self) -> list[str]:
         return list(self.by_name)
@@ -187,6 +197,23 @@ def diagnostics_tool(workspace: Workspace) -> Tool:
     )
 
 
+def security_report(workspace: Workspace) -> str:
+    return security.format_report(security.audit(workspace, docker=security.docker_available()))
+
+
+def security_tool(workspace: Workspace) -> Tool:
+    return Tool(
+        name="audit_security",
+        description="Security and failure-prevention audit of the project and the running containers: "
+        "Dockerfiles, compose files, exposed databases, privileged containers, the Docker socket, secrets in "
+        "files and logs, brute force and attack probes in logs. Returns findings with severity, location, "
+        "evidence and how to fix.",
+        params={},
+        required=(),
+        func=partial(security_report, workspace),
+    )
+
+
 # --- Change proposals ---------------------------------------------------------------------------------
 
 _EDITS_SCHEMA = {
@@ -217,13 +244,14 @@ def proposal_tool(store: ProposalStore) -> Tool:
                 "edits": _EDITS_SCHEMA},
         required=("title", "explanation", "edits"),
         func=propose_change,
+        writes=True,
     )
 
 
 def build_toolbox(workspace: Workspace | None = None, proposals: ProposalStore | None = None) -> Toolbox:
     tools = list(DOCKER_TOOLS)
     if workspace is not None:
-        tools += [*workspace_tools(workspace), diagnostics_tool(workspace)]
+        tools += [*workspace_tools(workspace), diagnostics_tool(workspace), security_tool(workspace)]
     if proposals is not None:
         tools.append(proposal_tool(proposals))
     return Toolbox(tools)

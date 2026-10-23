@@ -73,6 +73,12 @@ def test_list_files_filters_by_path_or_name(folder):
     assert folder.list_files("docker-compose.yml") == "docker-compose.yml"
 
 
+def test_globs_are_case_sensitive_on_every_os(tmp_path):
+    write(tmp_path, "Dockerfile", "FROM alpine:3.20\n")
+    write(tmp_path, "src/dockerfile.py", "x = 1\n")
+    assert Workspace(tmp_path).list_files("Dockerfile*") == "Dockerfile"
+
+
 def test_list_files_reports_when_nothing_matches(folder):
     assert folder.list_files("*.tf") == "(no files)"
 

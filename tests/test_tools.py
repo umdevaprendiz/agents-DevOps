@@ -7,7 +7,10 @@ from devops_agent.tools import DOCKER_TOOLS, Tool, Toolbox, _action_tool, build_
 from devops_agent.workspace import Workspace
 
 ACTIONS = {"restart_container", "start_container", "stop_container"}
-WORKSPACE_TOOLS = {"list_files", "read_file", "search_files", "git_status", "git_log", "git_diff", "collect_diagnostics"}
+WORKSPACE_TOOLS = {
+    "list_files", "read_file", "search_files", "git_status", "git_log", "git_diff",
+    "collect_diagnostics", "audit_security",
+}
 
 
 def echo_tool(**overrides) -> Tool:
@@ -80,6 +83,13 @@ def test_full_toolbox_adds_workspace_and_proposal_tools(full_toolbox):
 
 def test_only_container_actions_need_approval(full_toolbox):
     assert {tool.name for tool in full_toolbox.by_name.values() if tool.needs_approval} == ACTIONS
+
+
+def test_read_only_toolbox_has_no_proposals_or_actions(full_toolbox):
+    names = set(full_toolbox.read_only().names())
+    assert WORKSPACE_TOOLS <= names
+    assert "propose_change" not in names
+    assert not names & ACTIONS
 
 
 def test_toolbox_indexes_are_consistent(full_toolbox):

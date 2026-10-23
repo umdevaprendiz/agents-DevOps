@@ -38,6 +38,18 @@ jobs:
           docker run --rm -v "$PWD:/repo:ro" --entrypoint sh zricethezav/gitleaks:v8.21.2 -c \
             "git config --global --add safe.directory /repo && gitleaks git /repo --redact --no-banner"
 
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e .
+      - name: Audit this repository (fails on high severity)
+        run: devops-agent --lang en audit --fail-on high --no-docker
+
   docker-image:
     runs-on: ubuntu-latest
     steps:

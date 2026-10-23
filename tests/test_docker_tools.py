@@ -158,6 +158,19 @@ def test_summarize_never_exposes_env_values():
     assert FAKE_SECRET not in json.dumps(summary)
 
 
+def test_summarize_includes_security_fields():
+    raw = {
+        **RAW_INSPECT,
+        "Config": {**RAW_INSPECT["Config"], "User": "1000"},
+        "HostConfig": {**RAW_INSPECT["HostConfig"], "Privileged": True, "NetworkMode": "host", "CapAdd": ["NET_ADMIN"]},
+        "Mounts": [{"Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock"}],
+    }
+    summary = dk._summarize(raw)
+    assert (summary["user"], summary["privileged"], summary["network_mode"]) == ("1000", True, "host")
+    assert summary["cap_add"] == ["NET_ADMIN"]
+    assert summary["mounts"] == ["/var/run/docker.sock:/var/run/docker.sock"]
+
+
 def test_summarize_tolerates_missing_sections():
     summary = dk._summarize({"Name": "/x"})
     assert summary["name"] == "x"

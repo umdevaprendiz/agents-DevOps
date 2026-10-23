@@ -15,6 +15,7 @@ from . import git_tools as git
 from .agent import Agent
 from .config import Config
 from .i18n import get_language, t
+from .pipeline import Runner, Team
 from .proposals import ProposalError, ProposalStore
 from .redaction import redact
 from .ui import confirm, console, show_answer, show_diff, show_dim, show_error, show_ok, show_table
@@ -25,10 +26,15 @@ MAX_EXPLAIN_DIFF = 12_000
 
 @dataclass
 class Session:
-    agent: Agent
+    agent: Agent  # the main (heavy) model: free conversation
     proposals: ProposalStore
     cfg: Config
+    team: Team | None = None  # fast + heavy model: /debug, /audit, /suggest
     running: bool = True
+
+    @property
+    def runner(self) -> Runner:
+        return self.team or self.agent
 
 
 Handler = Callable[[Session, str], None]
@@ -45,7 +51,7 @@ class Command:
 
 # --- Talking to the agent ---------------------------------------------------------------------------
 
-def ask_agent(agent: Agent, task: str) -> None:
+def ask_agent(agent: Runner, task: str) -> None:
     try:
         show_answer(agent.run(task))
     except ollama.ResponseError as error:
@@ -115,7 +121,7 @@ def _help(session: Session, argument: str) -> None:
 
 
 def _clear(session: Session, argument: str) -> None:
-    session.agent.reset()
+    session.runner.reset()
     show_dim(t("cli.chat_reset"))
 
 
@@ -126,6 +132,7 @@ def _exit(session: Session, argument: str) -> None:
 def _status(session: Session, argument: str) -> None:
     rows = [
         (t("cmd.status.model"), session.cfg.model),
+        (t("cmd.status.fast_model"), session.cfg.fast_model or t("cmd.status.single_model")),
         (t("cmd.status.language"), get_language()),
         (t("cmd.status.workspace"), str(session.proposals.workspace.root)),
         *_repository_rows(session),
@@ -144,20 +151,26 @@ def _repository_rows(session: Session) -> list[tuple[str, str]]:
 
 # --- Debugging and suggestions (also used by the CLI) ---------------------------------------------------
 
-def debug(agent: Agent, store: ProposalStore, focus: str = "") -> bool:
+def debug(runner: Runner, store: ProposalStore, focus: str = "") -> bool:
     """Full debugging session: find what fails, explain it and propose fixes.
     Returns True when new proposals were created."""
     target = focus or t("prompt.debug_everything")
-    return _run_with_proposals(agent, store, t("prompt.debug", target=target))
+    return _run_with_proposals(runner, store, t("prompt.debug", target=target))
 
 
-def suggest(agent: Agent, store: ProposalStore, focus: str = "") -> bool:
+def suggest(runner: Runner, store: ProposalStore, focus: str = "") -> bool:
     """Review the project and propose only the changes that are really necessary."""
     extra = t("prompt.suggest_focus", focus=focus) if focus else ""
-    return _run_with_proposals(agent, store, t("prompt.suggest", focus=extra))
+    return _run_with_proposals(runner, store, t("prompt.suggest", focus=extra))
 
 
-def _run_with_proposals(agent: Agent, store: ProposalStore, task: str) -> bool:
+def security_review(runner: Runner, store: ProposalStore, focus: str = "") -> bool:
+    """Runs the security audit; the agent explains the findings and proposes fixes."""
+    extra = t("prompt.audit_focus", focus=focus) if focus else ""
+    return _run_with_proposals(runner, store, t("prompt.audit", focus=extra))
+
+
+def _run_with_proposals(agent: Runner, store: ProposalStore, task: str) -> bool:
     before = {proposal.id for proposal in _safe_pending(store)}
     ask_agent(agent, task)
     return _announce_new(store, before)
@@ -180,11 +193,15 @@ def _safe_pending(store: ProposalStore) -> list:
 
 
 def _debug(session: Session, focus: str) -> None:
-    debug(session.agent, session.proposals, focus)
+    debug(session.runner, session.proposals, focus)
 
 
 def _suggest(session: Session, focus: str) -> None:
-    suggest(session.agent, session.proposals, focus)
+    suggest(session.runner, session.proposals, focus)
+
+
+def _audit(session: Session, focus: str) -> None:
+    security_review(session.runner, session.proposals, focus)
 
 
 # --- Proposals -----------------------------------------------------------------------------------------
@@ -208,7 +225,7 @@ def _explain(session: Session, ref: str) -> None:
     proposal = session.proposals.get(ref or None)
     diff = redact(session.proposals.diff(proposal))[:MAX_EXPLAIN_DIFF]
     task = t("prompt.explain", title=proposal.title, explanation=proposal.explanation or "-", diff=diff)
-    ask_agent(session.agent, task)
+    ask_agent(session.agent, task)  # the diff is already the evidence: no investigation stage needed
 
 
 def _apply(session: Session, ref: str) -> None:
@@ -240,6 +257,7 @@ def _undo(session: Session, argument: str) -> None:
 COMMANDS: list[Command] = [
     Command("/help", ("/ajuda",), "", "cmd.help.help", _help),
     Command("/debug", ("/depurar",), "[focus]", "cmd.help.debug", _debug),
+    Command("/audit", ("/auditar",), "[focus]", "cmd.help.audit", _audit),
     Command("/suggest", ("/sugerir",), "[focus]", "cmd.help.suggest", _suggest),
     Command("/proposals", ("/propostas",), "", "cmd.help.proposals", _list),
     Command("/diff", (), "[id]", "cmd.help.diff", _diff),

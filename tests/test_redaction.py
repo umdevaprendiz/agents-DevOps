@@ -2,7 +2,7 @@
 so secret scanners such as gitleaks never find a real-looking token in this file."""
 import pytest
 
-from devops_agent.redaction import MASK, redact, redact_data
+from devops_agent.redaction import MASK, has_known_token, redact, redact_data
 
 AWS_KEY_ID = "AKIA" + "ABCDEFGHIJKLMNOP"
 GITHUB_TOKEN = "ghp_" + "a1B2" * 9
@@ -82,6 +82,12 @@ def test_normal_lines_are_untouched(line):
 )
 def test_variable_references_are_not_secrets(line):
     assert redact(line) == line
+
+
+def test_known_tokens_are_told_apart_from_generic_assignments():
+    assert has_known_token(f"using {GITHUB_TOKEN}")
+    assert has_known_token(f"postgres://app:{PASSWORD}@db/main")
+    assert not has_known_token(f"DB_PASSWORD={PASSWORD}")  # generic assignment: masked, but not a known format
 
 
 def test_redaction_is_idempotent():

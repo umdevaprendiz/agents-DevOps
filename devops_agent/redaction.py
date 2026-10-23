@@ -36,7 +36,7 @@ def _mask_url_password(match: re.Match[str]) -> str:
     return f"{match.group(1)}{MASK}{match.group(3)}"
 
 
-_RULES: tuple[tuple[re.Pattern[str], Replacement], ...] = (
+_TOKEN_RULES: tuple[tuple[re.Pattern[str], Replacement], ...] = (
     # PEM private keys (also cut ones, without the END line)
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.DOTALL), MASK),
     # user:password@host inside URLs (postgres://, redis://, https://...)
@@ -53,18 +53,38 @@ _RULES: tuple[tuple[re.Pattern[str], Replacement], ...] = (
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), MASK),  # Google API key
     (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b"), MASK),  # Telegram bot token
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), MASK),  # JWT
-    # key=value, key: value and "key": "value" when the key looks sensitive
-    (
-        re.compile(rf"(?i)(\b[\w.-]*(?:{_SENSITIVE_WORDS})[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;&]+)"),
-        _mask_assignment,
-    ),
 )
+
+# key=value, key: value and "key": "value" when the key looks sensitive. Group 2 is the value.
+ASSIGNMENT_RE = re.compile(
+    rf"(?i)(\b[\w.-]*(?:{_SENSITIVE_WORDS})[\w.-]*[\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;&]+)"
+)
+
+_RULES: tuple[tuple[re.Pattern[str], Replacement], ...] = (*_TOKEN_RULES, (ASSIGNMENT_RE, _mask_assignment))
+
+
+def has_known_token(text: str) -> bool:
+    """True when the text holds a well-known secret format (keys, tokens, JWTs, URL passwords)."""
+    return _apply(_TOKEN_RULES, text) != text
+
+
+def _apply(rules: tuple[tuple[re.Pattern[str], Replacement], ...], text: str) -> str:
+    for pattern, replacement in rules:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def is_sensitive_key(name: str) -> bool:
+    """DB_PASSWORD, api_key, GITHUB_TOKEN... look like they hold secrets."""
+    return bool(_SENSITIVE_KEY_RE.fullmatch(name))
+
+
+def is_reference(value: str) -> bool:
+    return _is_reference(value)
 
 
 def redact(text: str) -> str:
-    for pattern, replacement in _RULES:
-        text = pattern.sub(replacement, text)
-    return text
+    return _apply(_RULES, text)
 
 
 def redact_data(value: Any) -> Any:
@@ -79,6 +99,6 @@ def redact_data(value: Any) -> Any:
 
 
 def _redact_entry(key: Any, value: Any) -> Any:
-    if isinstance(key, str) and _SENSITIVE_KEY_RE.fullmatch(key) and value not in (None, ""):
+    if isinstance(key, str) and is_sensitive_key(key) and value not in (None, ""):
         return MASK
     return redact_data(value)

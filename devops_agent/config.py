@@ -25,6 +25,8 @@ def _env_int(name: str, default: int) -> int:
 @dataclass
 class Config:
     model: str = field(default_factory=lambda: _env("AGENT_MODEL", "qwen3:4b"))
+    # Optional faster model for the investigation stage; None = one model does everything.
+    fast_model: str | None = field(default_factory=lambda: _env("AGENT_FAST_MODEL"))
     # None lets the Ollama library use OLLAMA_HOST or http://localhost:11434
     ollama_host: str | None = field(default_factory=lambda: _env("OLLAMA_HOST"))
     language: str = field(default_factory=lambda: i18n.detect_language(_env("AGENT_LANGUAGE")))
@@ -35,6 +37,10 @@ class Config:
     audit_file: Path = field(default_factory=lambda: Path(_env("AGENT_AUDIT_FILE", "logs/audit.jsonl")))
     # Project the agent reads and proposes changes to (a git repository).
     workspace: Path = field(default_factory=lambda: Path(_env("AGENT_WORKSPACE", ".")))
+
+    def models(self) -> list[str]:
+        """Every model in use, without duplicates (the preflight checks each one)."""
+        return list(dict.fromkeys(name for name in (self.model, self.fast_model) if name))
 
 
 # --- .env file ------------------------------------------------------------------------------------

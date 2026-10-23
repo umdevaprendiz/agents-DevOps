@@ -281,7 +281,32 @@ def test_progress_indicator_wraps_every_model_call(make_agent):
 
     t_ = make_agent(assistant(calls=[("read_thing", {"container": "a"})]), assistant("done"), progress=progress)
     t_.agent.run("x")
-    assert seen == [t("agent.thinking")] * 2
+    assert seen == [t("agent.thinking", model=t_.agent.model)] * 2
+
+
+# --- Model and role -------------------------------------------------------------------------------------
+
+def test_model_can_be_overridden_per_agent(tmp_path, fake_tools):
+    cfg = Config()
+    agent = Agent(cfg, Console(file=io.StringIO()), lambda *a: True, AuditLog(tmp_path / "a.jsonl"),
+                  tools=fake_tools.toolbox, model="qwen3:1.7b")
+    agent.client = FakeClient(assistant("ok"))
+    agent.run("x")
+    assert agent.client.calls[0]["model"] == "qwen3:1.7b"
+
+
+def test_analyst_role_uses_the_investigation_prompt(tmp_path, fake_tools):
+    agent = Agent(Config(), Console(file=io.StringIO()), lambda *a: True, AuditLog(tmp_path / "a.jsonl"),
+                  tools=fake_tools.toolbox, role=agent_module.ANALYST)
+    assert agent.messages[0]["content"] == t("prompt.analyst_system")
+    assert "Do not fix anything" in agent.messages[0]["content"]
+
+
+def test_audit_records_model_and_role(make_agent):
+    t_ = make_agent(assistant("ok"))
+    t_.agent.run("x")
+    task = audit_records(t_.audit_path)[0]
+    assert (task["model"], task["role"]) == (t_.agent.model, agent_module.RESOLVER)
 
 
 # --- History and audit ---------------------------------------------------------------------------------

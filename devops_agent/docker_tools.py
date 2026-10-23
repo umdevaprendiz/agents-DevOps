@@ -205,6 +205,10 @@ def _host_summary(raw: dict) -> dict:
     return {
         "restart_policy": (host.get("RestartPolicy") or {}).get("Name") or "no",
         "memory_limit_mb": round(memory / 2**20) if memory else None,
+        "privileged": bool(host.get("Privileged")),
+        "network_mode": host.get("NetworkMode"),
+        "cap_add": host.get("CapAdd") or [],
+        "mounts": [f"{m.get('Source')}:{m.get('Destination')}" for m in raw.get("Mounts") or []],
     }
 
 
@@ -212,6 +216,7 @@ def _config_summary(raw: dict) -> dict:
     config = raw.get("Config") or {}
     return {
         "image": config.get("Image"),
+        "user": config.get("User") or "",
         "healthcheck": (config.get("Healthcheck") or {}).get("Test"),
         "entrypoint": config.get("Entrypoint"),
         "command": config.get("Cmd"),

@@ -24,6 +24,9 @@ ToolCall = tuple[str, dict]
 HISTORY_TURNS = 3
 TEMPERATURE = 0.1
 AUDIT_OUTPUT_CHARS = 500
+RESOLVER = "resolver"
+ANALYST = "analyst"
+SYSTEM_PROMPTS = {RESOLVER: "prompt.system", ANALYST: "prompt.analyst_system"}
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _THINK_END = "</think>"
@@ -102,6 +105,8 @@ class Agent:
         label: str | None = None,
         progress: Progress | None = None,
         tools: Toolbox | None = None,
+        model: str | None = None,
+        role: str = RESOLVER,
     ):
         self.cfg = cfg
         self.console = console
@@ -109,6 +114,8 @@ class Agent:
         self.audit = audit
         self.label = label
         self.tools = tools or build_toolbox()
+        self.model = model or cfg.model
+        self.role = role
         self.client = ollama.Client(host=cfg.ollama_host)
         self._progress = progress or _no_progress
         self._send_think = True
@@ -116,7 +123,7 @@ class Agent:
         self.reset()
 
     def reset(self) -> None:
-        self.messages: list = [{"role": "system", "content": t("prompt.system")}]
+        self.messages: list = [{"role": "system", "content": t(SYSTEM_PROMPTS[self.role])}]
 
     def run(self, task: str, require_evidence: bool = False) -> str:
         """Solves a task and returns the model's final answer.
@@ -149,7 +156,7 @@ class Agent:
     def _start(self, task: str) -> None:
         self.messages.append({"role": "user", "content": task})
         self._trim_history()
-        self._audit("task", task=task, model=self.cfg.model)
+        self._audit("task", task=task, model=self.model, role=self.role)
 
     def _step(self) -> str | None:
         """One round: asks the model and runs the requested tools.
@@ -187,14 +194,14 @@ class Agent:
 
     def _ask_model(self, with_tools: bool):
         """Calls the model and stores its answer in the history."""
-        with self._progress(t("agent.thinking")):
+        with self._progress(t("agent.thinking", model=self.model)):
             message = self._chat(self._chat_kwargs(with_tools))
         self.messages.append(message)
         return message
 
     def _chat_kwargs(self, with_tools: bool) -> dict:
         kwargs = {
-            "model": self.cfg.model,
+            "model": self.model,
             "messages": self.messages,
             "options": {"temperature": TEMPERATURE, "num_ctx": self.cfg.num_ctx},
         }

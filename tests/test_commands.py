@@ -125,6 +125,53 @@ def test_debug_announces_the_fixes_it_proposed(git_repo, output):
     assert f"/apply {store.get().id}" in output.getvalue()
 
 
+# --- Two models ------------------------------------------------------------------------------------
+
+def test_investigative_commands_use_the_team_and_chat_uses_the_main_model(git_repo, output):
+    from devops_agent.pipeline import Team
+
+    store = ProposalStore(Workspace(git_repo))
+    chat_agent, analyst = FakeAgent(store), FakeAgent(store)
+    session = Session(chat_agent, store, Config(), team=Team(chat_agent, analyst))
+
+    handle_input(session, "hello")
+    dispatch(session, "/debug web")
+
+    assert len(analyst.tasks) == 1 and "Debug web" in analyst.tasks[0]
+    assert chat_agent.tasks[0] == "hello"
+    assert "A faster model already investigated" in chat_agent.tasks[1]
+
+
+def test_clear_resets_both_models(git_repo, output):
+    from devops_agent.pipeline import Team
+
+    store = ProposalStore(Workspace(git_repo))
+    chat_agent, analyst = FakeAgent(store), FakeAgent(store)
+    session = Session(chat_agent, store, Config(), team=Team(chat_agent, analyst))
+    dispatch(session, "/clear")
+    assert (chat_agent.resets, analyst.resets) == (1, 1)
+
+
+def test_status_shows_the_investigation_model(session, output):
+    session.cfg.fast_model = "qwen3:1.7b"
+    dispatch(session, "/status")
+    assert "qwen3:1.7b" in output.getvalue()
+
+
+# --- /audit --------------------------------------------------------------------------------------
+
+def test_audit_asks_the_agent_to_run_the_security_audit(session, output):
+    dispatch(session, "/audit secrets")
+    task = session.agent.tasks[0]
+    assert task.startswith("Run audit_security, then focus on: secrets")
+
+
+def test_audit_has_a_portuguese_alias(session, output):
+    i18n.set_language("pt-BR")
+    dispatch(session, "/auditar")
+    assert session.agent.tasks[0].startswith("Rode audit_security e aja")
+
+
 # --- /suggest ------------------------------------------------------------------------------------
 
 def test_suggest_sends_the_focus_and_announces_new_proposals(git_repo, output):

@@ -170,7 +170,7 @@ def test_investigator_runs_one_agent_per_issue_with_evidence(monkeypatch):
     created = []
 
     class RecordingAgent(FakeAgent):
-        def __init__(self, cfg, console, approver, audit, label=None, progress=None, tools=None):
+        def __init__(self, cfg, console, approver, audit, label=None, progress=None, tools=None, model=None, role=None):
             super().__init__()
             self.label = label
             created.append(self)
@@ -189,6 +189,56 @@ def test_investigator_runs_one_agent_per_issue_with_evidence(monkeypatch):
     assert sorted(agent.label for agent in created) == ["api", "web"]
     assert all(agent.runs[0][1] is True for agent in created)
     assert sorted(results) == [("api", "answer 1"), ("web", "answer 1")]
+
+
+# --- Two models ----------------------------------------------------------------------------------------
+
+def test_fast_model_option():
+    args = cli.build_parser().parse_args(["--fast-model", "qwen3:1.7b", "debug"])
+    assert cli._apply_overrides(Config(), args).fast_model == "qwen3:1.7b"
+
+
+def test_single_model_team(tmp_path):
+    cfg = Config()
+    cfg.fast_model = None
+    team = cli.build_team(cfg, SimpleNamespace(log=lambda *a, **k: None))
+    assert team.two_stage is False
+    assert team.resolver.model == cfg.model
+
+
+def test_two_model_team_gives_the_analyst_only_read_tools(tmp_path):
+    from devops_agent.proposals import ProposalStore
+    from devops_agent.tools import build_toolbox
+    from devops_agent.workspace import Workspace
+
+    cfg = Config()
+    cfg.model, cfg.fast_model = "qwen3:8b", "qwen3:4b"
+    workspace = Workspace(tmp_path)
+    tools = build_toolbox(workspace, ProposalStore(workspace))
+    team = cli.build_team(cfg, SimpleNamespace(log=lambda *a, **k: None), tools, label="api")
+
+    assert (team.resolver.model, team.analyst.model) == ("qwen3:8b", "qwen3:4b")
+    assert team.analyst.role == "analyst" and team.analyst.label == "api · qwen3:4b"
+    assert "propose_change" in team.resolver.tools.names()
+    assert "propose_change" not in team.analyst.tools.names()
+    assert "restart_container" not in team.analyst.tools.names()
+
+
+def test_preflight_checks_every_model(monkeypatch, output):
+    checked = []
+
+    class FakeOllama:
+        def __init__(self, host=None):
+            pass
+
+        def show(self, model):
+            checked.append(model)
+
+    monkeypatch.setattr(cli.ollama, "Client", FakeOllama)
+    cfg = Config()
+    cfg.model, cfg.fast_model = "qwen3:8b", "qwen3:4b"
+    assert cli._check_ollama(cfg) is True
+    assert checked == ["qwen3:8b", "qwen3:4b"]
 
 
 # --- Workspace check -----------------------------------------------------------------------------------

@@ -103,6 +103,15 @@ def listed_files(root: Path) -> list[str]:
     return sorted({name for name in output.split("\0") if name})
 
 
+def tracked_files(root: Path) -> list[str]:
+    """Files committed or staged (paths relative to root)."""
+    return sorted(name for name in _git(root, ["ls-files", "-z"]).split("\0") if name)
+
+
+def is_ignored(root: Path, path: str) -> bool:
+    return _succeeds(root, ["check-ignore", "-q", "--", path])
+
+
 def read_blob(root: Path, ref: str, path: str) -> str | None:
     """File content at a commit, or None when the file does not exist there."""
     if not _succeeds(root, ["cat-file", "-e", f"{ref}:{path}"]):

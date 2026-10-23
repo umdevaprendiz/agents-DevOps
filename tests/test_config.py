@@ -75,6 +75,19 @@ def test_variables_override_defaults(clean_env):
     assert (cfg.model, cfg.workers, cfg.audit_file) == ("qwen3:8b", 8, Path("/data/audit.jsonl"))
 
 
+def test_fast_model_is_optional(clean_env):
+    cfg = Config()
+    assert cfg.fast_model is None
+    assert cfg.models() == ["qwen3:4b"]
+
+
+def test_fast_model_and_unique_model_list(clean_env):
+    clean_env.update(AGENT_MODEL="qwen3:8b", AGENT_FAST_MODEL="qwen3:4b")
+    assert Config().models() == ["qwen3:8b", "qwen3:4b"]
+    clean_env["AGENT_FAST_MODEL"] = "qwen3:8b"
+    assert Config().models() == ["qwen3:8b"]
+
+
 def test_language_variable_is_normalized(clean_env):
     clean_env["AGENT_LANGUAGE"] = "pt_BR"
     assert Config().language == "pt-BR"

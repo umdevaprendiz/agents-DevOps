@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "ollama>=0.5.1",
     "rich>=13.7",
+    "pyyaml>=6",
 ]
 keywords = ["devops", "docker", "ollama", "llm", "agent", "monitoring", "sre"]
 classifiers = [

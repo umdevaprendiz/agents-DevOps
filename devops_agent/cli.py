@@ -2,28 +2,33 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from datetime import datetime
 
 import ollama
 from rich.markup import escape
+from rich.table import Table
 
 from . import docker_tools as dk
 from . import git_tools as git
 from . import i18n
-from .agent import Agent
+from . import security
+from .agent import ANALYST, Agent
 from .audit import AuditLog
 from .commands import Session, ask_agent, debug, run_chat
 from .config import Config, load_env_file
 from .i18n import t
 from .monitor import Issue, Monitor
+from .pipeline import Team
 from .proposals import ProposalStore
 from .tools import Toolbox, build_toolbox
-from .ui import ask_approval, console, show_answer, show_dim, show_error, show_ok, spinner
+from .ui import ask_approval, console, show_answer, show_brief, show_dim, show_error, show_ok, spinner
 from .workers import Investigator
 from .workspace import Workspace
 
 CHECK_LOG_WINDOW = 300  # seconds of logs scanned by the check command
+SEVERITY_STYLES = {"high": "bold red", "medium": "yellow", "low": "dim"}
 
 
 # --- Startup checks ---------------------------------------------------------------------------------
@@ -43,12 +48,17 @@ def _check_docker() -> bool:
 
 
 def _check_ollama(cfg: Config) -> bool:
+    client = ollama.Client(host=cfg.ollama_host)
+    return all([_check_model(client, model) for model in cfg.models()])
+
+
+def _check_model(client: ollama.Client, model: str) -> bool:
     try:
-        ollama.Client(host=cfg.ollama_host).show(cfg.model)
-        show_ok(t("cli.ollama_ok", model=cfg.model))
+        client.show(model)
+        show_ok(t("cli.ollama_ok", model=model))
         return True
     except ollama.ResponseError:
-        show_error(t("cli.model_missing", model=cfg.model), hint=t("cli.model_hint", model=cfg.model))
+        show_error(t("cli.model_missing", model=model), hint=t("cli.model_hint", model=model))
     except Exception as error:  # connection refused, timeout...
         show_error(t("cli.ollama_down"), str(error), t("cli.ollama_hint"))
     return False
@@ -126,13 +136,72 @@ def _heartbeat(new: int, running: int, last: tuple[int, int] | None) -> tuple[in
     return snapshot
 
 
+def build_team(cfg: Config, audit: AuditLog, tools: Toolbox | None = None, label: str | None = None, progress=None) -> Team:
+    """The heavy model resolves; with AGENT_FAST_MODEL set, a fast read-only model investigates first."""
+    tools = tools or build_toolbox()
+    resolver = Agent(cfg, console, ask_approval, audit, label=label, progress=progress, tools=tools)
+    if not cfg.fast_model:
+        return Team(resolver)
+    analyst_label = f"{label} · {cfg.fast_model}" if label else cfg.fast_model
+    analyst = Agent(
+        cfg, console, ask_approval, audit, label=analyst_label, progress=progress,
+        tools=tools.read_only(), model=cfg.fast_model, role=ANALYST,
+    )
+    return Team(resolver, analyst, on_brief=lambda brief: show_brief(brief, cfg.fast_model, label))
+
+
 def build_investigator(cfg: Config, audit: AuditLog, tools: Toolbox | None = None) -> Investigator:
     def investigate(issue: Issue) -> str:
-        # One Agent per investigation: agents keep conversation state and are not thread-safe.
-        agent = Agent(cfg, console, ask_approval, audit, label=issue.container, tools=tools)
-        return agent.run(issue.task(), require_evidence=True)
+        # One team per investigation: agents keep conversation state and are not thread-safe.
+        team = build_team(cfg, audit, tools, label=issue.container)
+        return team.run(issue.task(), require_evidence=True)
 
     return Investigator(investigate, cfg.workers, on_result=report_result, on_error=report_error)
+
+
+# --- Security audit (no model, no Ollama needed) ----------------------------------------------------------
+
+def run_audit(cfg: Config, args: argparse.Namespace) -> int:
+    """Exit code 0 = nothing at or above --fail-on, 1 = findings at or above it, 2 = no workspace."""
+    if not cfg.workspace.resolve().is_dir():
+        show_error(t("cli.workspace_missing"), str(cfg.workspace.resolve()), t("cli.workspace_hint"))
+        return 2
+    use_docker = not args.no_docker and security.docker_available()
+    findings = security.audit(Workspace(cfg.workspace), docker=use_docker)
+    if args.json:
+        _write_utf8(security.as_json(findings) + "\n")
+    else:
+        show_findings(findings)
+    return 1 if security.fails(findings, args.fail_on) else 0
+
+
+def _write_utf8(text: str) -> None:
+    """Machine output is always UTF-8, whatever the console code page (cp1252 on Windows)."""
+    sys.stdout.flush()
+    sys.stdout.buffer.write(text.encode("utf-8"))
+    sys.stdout.buffer.flush()
+
+
+def show_findings(findings: list[security.Finding]) -> None:
+    if not findings:
+        show_ok(escape(t("sec.report.none")))
+        return
+    title = t("sec.report.header", **security.count_by_severity(findings))
+    table = Table(title=escape(title), title_justify="left", show_lines=True)
+    for key in ("sec.col.severity", "sec.col.rule", "sec.col.location", "sec.col.problem"):
+        table.add_column(t(key))
+    for finding in findings:
+        table.add_row(*_finding_cells(finding))
+    console.print(table)
+
+
+def _finding_cells(finding: security.Finding) -> tuple[str, str, str, str]:
+    style = SEVERITY_STYLES[finding.severity]
+    problem = escape(finding.title())
+    if finding.detail:
+        problem += f"\n[dim]{escape(finding.detail)}[/]"
+    problem += f"\n[cyan]→ {escape(finding.fix())}[/]"
+    return f"[{style}]{security.severity_label(finding.severity)}[/]", finding.rule.id, escape(finding.location), problem
 
 
 # --- Arguments -----------------------------------------------------------------------------------------
@@ -140,15 +209,24 @@ def build_investigator(cfg: Config, audit: AuditLog, tools: Toolbox | None = Non
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="devops-agent", description=t("cli.help.description"))
     parser.add_argument("--model", help=t("cli.help.model"))
+    parser.add_argument("--fast-model", help=t("cli.help.fast_model"))
     parser.add_argument("--lang", help=t("cli.help.lang"))
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("chat", help=t("cli.help.chat"))
     sub.add_parser("ask", help=t("cli.help.ask")).add_argument("question", nargs="+")
     sub.add_parser("debug", help=t("cli.help.debug")).add_argument("focus", nargs="*", help=t("cli.help.focus"))
+    _add_audit_options(sub.add_parser("audit", help=t("cli.help.audit")))
     _add_monitor_options(sub.add_parser("check", help=t("cli.help.check")))
     _add_watch_options(sub.add_parser("watch", help=t("cli.help.watch")))
     return parser
+
+
+def _add_audit_options(parser: argparse.ArgumentParser) -> None:
+    choices = [*security.SEVERITIES, security.NEVER]
+    parser.add_argument("--fail-on", choices=choices, default="high", help=t("cli.help.fail_on"))
+    parser.add_argument("--json", action="store_true", help=t("cli.help.json"))
+    parser.add_argument("--no-docker", action="store_true", help=t("cli.help.no_docker"))
 
 
 def _add_monitor_options(parser: argparse.ArgumentParser) -> None:
@@ -180,6 +258,8 @@ def _parse_only(value: str | None) -> set[str] | None:
 def _apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     if args.model:
         cfg.model = args.model
+    if args.fast_model:
+        cfg.fast_model = args.fast_model
     if getattr(args, "workers", None):
         cfg.workers = args.workers
     return cfg
@@ -203,13 +283,13 @@ def _dispatch(args: argparse.Namespace, cfg: Config, audit: AuditLog) -> None:
     if args.command in ("check", "watch"):
         _run_monitor(args, cfg, audit, tools)
         return
-    agent = Agent(cfg, console, ask_approval, audit, progress=spinner, tools=tools)
+    team = build_team(cfg, audit, tools, progress=spinner)
     if args.command == "chat":
-        run_chat(Session(agent, proposals, cfg))
+        run_chat(Session(team.resolver, proposals, cfg, team=team))
     elif args.command == "debug":
-        _run_debug(agent, proposals, args.focus)
+        _run_debug(team, proposals, args.focus)
     else:
-        ask_agent(agent, " ".join(args.question))
+        ask_agent(team.resolver, " ".join(args.question))
 
 
 def _run_monitor(args: argparse.Namespace, cfg: Config, audit: AuditLog, tools: Toolbox) -> None:
@@ -220,8 +300,8 @@ def _run_monitor(args: argparse.Namespace, cfg: Config, audit: AuditLog, tools: 
         cmd_watch(investigator, _build_monitor(args), args.interval)
 
 
-def _run_debug(agent: Agent, proposals: ProposalStore, focus_words: list[str]) -> None:
-    if debug(agent, proposals, " ".join(focus_words)):
+def _run_debug(team: Team, proposals: ProposalStore, focus_words: list[str]) -> None:
+    if debug(team, proposals, " ".join(focus_words)):
         show_dim(t("cli.review_in_chat"))
 
 
@@ -231,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.language = i18n.set_language(_language_argument(argv) or cfg.language)
     args = build_parser().parse_args(argv)
     _apply_overrides(cfg, args)
+    if args.command == "audit":
+        return run_audit(cfg, args)
     if not preflight(cfg):
         return 1
     try:

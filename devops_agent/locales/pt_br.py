@@ -6,7 +6,7 @@ MESSAGES = {
     "prompt.system": """Você é um agente autônomo de DevOps. Você ajuda com qualquer coisa de DevOps: containers, arquivos de infraestrutura e configuração, código da aplicação, logs, alertas de segurança e prevenção de falhas.
 
 Como você trabalha:
-1. Investigue antes de concluir. Quando não souber onde está o problema, comece por collect_diagnostics. Ferramentas de Docker: list_containers, inspect_container, get_container_logs, get_container_stats. Ferramentas do projeto: list_files, read_file, search_files, git_status, git_log, git_diff.
+1. Investigue antes de concluir. Quando não souber onde está o problema, comece por collect_diagnostics; para questões de segurança, comece por audit_security. Ferramentas de Docker: list_containers, inspect_container, get_container_logs, get_container_stats. Ferramentas do projeto: list_files, read_file, search_files, git_status, git_log, git_diff, audit_security.
 2. Baseie-se só no que as ferramentas retornaram. Não invente nomes, arquivos, variáveis, logs ou números.
 3. Para alterar arquivos, chame propose_change com a menor edição que resolve o problema. Mude só o necessário: nada de refatorações ou mudanças de estilo, e nunca segredos (use referências como ${{VARIAVEL}}). A proposta vai para uma branch própria no git; o operador revisa e decide.
 4. Só proponha restart/start/stop quando isso puder resolver; essas ações pedem aprovação humana. Se uma for negada, não repita; sugira alternativas.
@@ -23,6 +23,26 @@ Ao relatar problemas, responda em português, com um bloco por problema:
 **Como resolver:** passos concretos, comandos ou configurações a usar
 **Mudança proposta:** o id da proposta, se você criou uma com propose_change
 Para outros pedidos, responda em português, de forma natural e concisa.""",
+    "prompt.analyst_system": """Você é a etapa de investigação de um agente autônomo de DevOps. Um modelo mais forte vai escrever o diagnóstico final e a correção usando só o seu relatório.
+
+Como você trabalha:
+1. Investigue com suas ferramentas de leitura: comece por collect_diagnostics (ou audit_security em questões de segurança), depois leia os logs, inspecione os containers e leia ou busque os arquivos do projeto envolvidos.
+2. Baseie-se só no que as ferramentas retornaram. Não invente nomes, arquivos, linhas ou números.
+3. Não corrija nada e não explique como corrigir: isso é trabalho da próxima etapa.
+4. Valores mostrados como [REDACTED] foram ocultados de propósito. Nunca tente revelá-los.
+
+Responda em português com este relatório, curto e factual:
+## Sintomas
+## Evidências (linhas exatas, cada uma com a origem: container ou arquivo:linha)
+## Causa suspeita
+## Arquivos envolvidos (caminhos que a correção provavelmente vai alterar)
+## Dúvidas em aberto""",
+    "prompt.analyze": "Investigue este pedido e escreva o seu relatório:\n\n{task}",
+    "prompt.resolve": (
+        "{task}\n\nUm modelo mais rápido já investigou e escreveu este relatório:\n\n{brief}\n\n"
+        "Confira as evidências principais (leia um arquivo antes de alterá-lo), depois responda no formato "
+        "pedido e proponha a correção. Se o relatório estiver errado ou incompleto, investigue o que falta."
+    ),
     "prompt.step_limit": "Limite de passos atingido. Responda agora com o que já descobriu, no formato pedido.",
     "prompt.evidence": (
         "Você respondeu sem usar nenhuma ferramenta. Não invente dados: chame inspect_container "
@@ -45,13 +65,22 @@ Para outros pedidos, responda em português, de forma natural e concisa.""",
         "chame propose_change com a menor edição. Não proponha mudanças desnecessárias."
     ),
     "prompt.debug_everything": "o ambiente inteiro (containers e projeto)",
+    "prompt.audit": (
+        "Rode audit_security{focus} e aja sobre o resultado. Explique os achados de severidade alta e média no "
+        "formato pedido, dos mais graves para os menos graves, e diga quando a evidência mostrar um falso "
+        "positivo. Para achados em arquivos do projeto, chame propose_change com a menor correção; para "
+        "containers em execução ou o host, mostre o comando ou a configuração exata. Cite os achados de "
+        "severidade baixa numa única linha de resumo."
+    ),
+    "prompt.audit_focus": ", depois foque em: {focus}",
     "prompt.explain": (
         "Explique esta mudança proposta ao operador em linguagem simples: o que muda, por que é necessária, "
         "os riscos e como testar. Seja breve.\n\nTítulo: {title}\nExplicação do autor: {explanation}\n\n"
         "Diff:\n{diff}"
     ),
     # --- Agent ------------------------------------------------------------------------------------
-    "agent.thinking": "pensando...",
+    "agent.thinking": "pensando ({model})...",
+    "team.brief_title": "Investigação · {model}",
     "agent.unknown_tool": "✗ ferramenta desconhecida: {name}",
     "agent.denied": "ação negada",
     "agent.evidence_rejected": "resposta sem evidências recusada; pedindo investigação",
@@ -88,6 +117,78 @@ Para outros pedidos, responda em português, de forma natural e concisa.""",
     "diag.log_file": "- {path} ({count} linhas de erro, as mais recentes:)",
     "diag.infra_title": "Arquivos de infraestrutura:",
     "diag.infra_none": "Arquivos de infraestrutura: nenhum encontrado.",
+    # --- Security audit -----------------------------------------------------------------------------
+    "sec.severity.high": "ALTA",
+    "sec.severity.medium": "MÉDIA",
+    "sec.severity.low": "BAIXA",
+    "sec.report.header": "Auditoria de segurança: {high} alta(s), {medium} média(s), {low} baixa(s).",
+    "sec.report.none": "Auditoria de segurança: nenhum problema encontrado.",
+    "sec.report.fix": "Como corrigir: {fix}",
+    "sec.col.severity": "Severidade",
+    "sec.col.rule": "Regra",
+    "sec.col.location": "Onde",
+    "sec.col.problem": "Problema e correção",
+    "sec.location.service": "{path} (serviço {service})",
+    "sec.location.container": "container {name}",
+    "sec.detail.auth": "{count} falhas de autenticação; principais origens: {sources}",
+    "sec.detail.attacks": "{count} requisições suspeitas, ex.: {example}",
+    "sec.detail.secrets": "{count} linhas, ex.: {example}",
+    "sec.df001.title": "Imagem base sem versão fixa (latest ou sem tag)",
+    "sec.df001.fix": "Fixe a imagem numa versão (ex.: node:20.11-alpine) ou num digest (@sha256:...) para builds reproduzíveis.",
+    "sec.df002.title": "Container roda como root",
+    "sec.df002.fix": "Crie um usuário sem privilégios e troque para ele com USER no estágio final (ex.: RUN useradd -r app, depois USER app).",
+    "sec.df003.title": "Script remoto executado direto no shell (curl | sh)",
+    "sec.df003.fix": "Baixe o script, verifique o checksum ou a assinatura e só então execute; ou instale um pacote com versão fixa.",
+    "sec.df004.title": "Segredo gravado na imagem (ENV/ARG)",
+    "sec.df004.fix": "Tire o valor do Dockerfile; passe-o na execução (variável de ambiente, gerenciador de segredos) ou use segredos do BuildKit (RUN --mount=type=secret).",
+    "sec.df005.title": "Todo o contexto de build copiado sem .dockerignore",
+    "sec.df005.fix": "Crie um .dockerignore excluindo .env*, .git, chaves e dados locais, ou copie só os arquivos que a imagem precisa.",
+    "sec.df006.title": "Imagem final sem HEALTHCHECK",
+    "sec.df006.fix": "Adicione um HEALTHCHECK (ex.: HEALTHCHECK CMD wget -qO- http://localhost:PORTA/health || exit 1) ou defina um no compose.",
+    "sec.df007.title": "apt-get install sem --no-install-recommends",
+    "sec.df007.fix": "Use apt-get install --no-install-recommends e apague /var/lib/apt/lists/* no mesmo RUN para a imagem ficar menor.",
+    "sec.df008.title": "Permissões de escrita para todos (chmod 777)",
+    "sec.df008.fix": "Dê só o necessário (ex.: chown app:app e chmod 750) em vez de 777.",
+    "sec.dc001.title": "Container privilegiado",
+    "sec.dc001.fix": "Remova privileged: true e adicione só as capabilities que o serviço precisa com cap_add.",
+    "sec.dc002.title": "Socket do Docker montado num container (acesso root ao host)",
+    "sec.dc002.fix": "Evite montar /var/run/docker.sock; se for mesmo necessário, use um proxy de socket que libere só os endpoints exigidos.",
+    "sec.dc003.title": "Segredo escrito no arquivo do compose",
+    "sec.dc003.fix": "Mova o valor para um .env ignorado pelo git ou para Docker secrets e referencie como ${{VARIAVEL}}.",
+    "sec.dc004.title": "Porta de banco de dados publicada em todas as interfaces de rede",
+    "sec.dc004.fix": "Não publique a porta, ou prenda-a ao localhost (\"127.0.0.1:5432:5432\") e acesse o banco pela rede interna.",
+    "sec.dc005.title": "Imagem sem versão fixa (latest ou sem tag)",
+    "sec.dc005.fix": "Fixe a versão da imagem (ex.: postgres:16.3) para que todo deploy rode o mesmo software.",
+    "sec.dc006.title": "Serviço usa a rede do host",
+    "sec.dc006.fix": "Remova network_mode: host e publique só as portas que o serviço precisa.",
+    "sec.dc007.title": "Serviço publica portas mas não tem healthcheck",
+    "sec.dc007.fix": "Adicione um healthcheck para o Docker saber quando o serviço está pronto de verdade e poder reiniciá-lo se travar.",
+    "sec.dc008.title": "Sem limite de memória",
+    "sec.dc008.fix": "Defina mem_limit (ou deploy.resources.limits.memory) para que um serviço não esgote a memória do host.",
+    "sec.rc001.title": "Container rodando em modo privilegiado",
+    "sec.rc001.fix": "Recrie-o sem --privileged, adicionando só as capabilities necessárias (--cap-add).",
+    "sec.rc002.title": "Container em execução com o socket do Docker montado",
+    "sec.rc002.fix": "Recrie-o sem -v /var/run/docker.sock, ou coloque um proxy de socket no meio.",
+    "sec.rc003.title": "Banco de dados em execução acessível em todas as interfaces de rede",
+    "sec.rc003.fix": "Recrie-o publicando a porta só em 127.0.0.1 (-p 127.0.0.1:5432:5432) ou sem publicá-la.",
+    "sec.rc004.title": "Container em execução roda como root",
+    "sec.rc004.fix": "Rode-o com um usuário sem privilégios (USER no Dockerfile, --user, ou user: no compose).",
+    "sec.rc005.title": "Container em execução usa a rede do host",
+    "sec.rc005.fix": "Recrie-o numa rede bridge e publique só as portas necessárias.",
+    "sec.rc006.title": "Container em execução sem limite de memória",
+    "sec.rc006.fix": "Defina um limite de memória (--memory ou mem_limit) para que ele não esgote o host.",
+    "sec.lg001.title": "Possível ataque de força bruta (muitas falhas de autenticação)",
+    "sec.lg001.fix": "Bloqueie ou limite as origens (fail2ban, firewall, WAF), exija senhas fortes ou chaves e verifique se algum login teve sucesso.",
+    "sec.lg002.title": "Tentativas de ataque nos logs (path traversal, SQL injection, scanners)",
+    "sec.lg002.fix": "Confirme que as requisições foram recusadas (4xx), mantenha o software atualizado e considere um WAF ou rate limiting.",
+    "sec.lg003.title": "Segredo impresso nos logs",
+    "sec.lg003.fix": "Pare de registrar o valor (mascare-o na aplicação), troque o segredo exposto e restrinja o acesso aos logs.",
+    "sec.sc001.title": "Segredo fixo no código do repositório",
+    "sec.sc001.fix": "Mova o valor para uma variável de ambiente ou um gerenciador de segredos, troque-o (ele está no histórico do git) e referencie como ${{VARIAVEL}}.",
+    "sec.sc002.title": "Arquivo de segredos commitado no git",
+    "sec.sc002.fix": "Remova-o do repositório (git rm --cached), adicione ao .gitignore, troque todos os segredos dele e limpe o histórico se o repositório for público.",
+    "sec.sc003.title": "Arquivo de segredos não ignorado pelo git (pode ser commitado sem querer)",
+    "sec.sc003.fix": "Adicione-o ao .gitignore (ex.: .env e .env.*, mantendo !.env.example).",
     "git.cli_missing": "git não encontrado no PATH.",
     "git.timeout": "'git {command}' excedeu {seconds}s.",
     "git.exit_code": "'git {command}' saiu com código {code}",
@@ -129,6 +230,7 @@ Para outros pedidos, responda em português, de forma natural e concisa.""",
     "cmd.col.branch": "Branch",
     "cmd.help.help": "Mostra esta lista",
     "cmd.help.debug": "Descobre o que está falhando (containers, logs, projeto), explica cada bug e propõe correções",
+    "cmd.help.audit": "Auditoria de segurança e prevenção de falhas; o agente explica os achados e propõe correções",
     "cmd.help.suggest": "O agente revisa o projeto e propõe só as mudanças necessárias",
     "cmd.help.proposals": "Lista as propostas pendentes",
     "cmd.help.diff": "Mostra as alterações de uma proposta (padrão: a mais recente)",
@@ -152,6 +254,8 @@ Para outros pedidos, responda em português, de forma natural e concisa.""",
     "cmd.confirm_pr": "Enviar a branch {branch} para o origin e abrir um pull request?",
     "cmd.status_title": "Status",
     "cmd.status.model": "Modelo",
+    "cmd.status.fast_model": "Modelo de investigação",
+    "cmd.status.single_model": "(nenhum: um modelo faz tudo)",
     "cmd.status.language": "Idioma",
     "cmd.status.workspace": "Workspace",
     "cmd.status.branch": "Branch",
@@ -211,12 +315,17 @@ Para outros pedidos, responda em português, de forma natural e concisa.""",
     "cli.stopped": "encerrado",
     "cli.help.description": "Agente autônomo de DevOps com LLM local (Ollama).",
     "cli.help.model": "modelo do Ollama (padrão: AGENT_MODEL ou qwen3:4b)",
+    "cli.help.fast_model": "modelo mais rápido para a etapa de investigação (padrão: AGENT_FAST_MODEL; vazio = um modelo faz tudo)",
     "cli.help.lang": "idioma: en ou pt-BR (padrão: AGENT_LANGUAGE ou o idioma do sistema)",
     "cli.help.chat": "conversa interativa com o agente (digite /ajuda dentro dela)",
     "cli.help.ask": "faz uma pergunta e sai",
     "cli.help.debug": "descobre o que está falhando, explica cada bug e propõe correções",
     "cli.help.focus": "foco opcional: um container, um arquivo ou um sintoma",
     "cli.review_in_chat": "Revise e decida no chat: devops-agent chat, depois /diff, /explain, /apply ou /pr.",
+    "cli.help.audit": "auditoria de segurança e prevenção de falhas (não precisa do modelo; ótima para CI)",
+    "cli.help.fail_on": "sai com código 1 quando houver achado com pelo menos esta severidade: high, medium, low ou never (padrão high)",
+    "cli.help.json": "mostra os achados em JSON",
+    "cli.help.no_docker": "ignora os containers em execução e seus logs",
     "cli.help.check": "verifica uma vez e investiga cada problema encontrado",
     "cli.help.watch": "monitora continuamente",
     "cli.help.only": "só estes containers (separados por vírgula)",

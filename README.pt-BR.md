@@ -6,6 +6,8 @@ Agente autônomo de DevOps que **depura** seus containers e seu projeto com um *
 
 - **Depuração de ponta a ponta:** containers, logs dos containers, arquivos de log do projeto, Dockerfiles, compose, CI, configuração e código.
 - **Explica como um engenheiro:** cada problema vem como *Problema → Erro → Causa → Como resolver → Mudança proposta*.
+- **Audita a segurança:** 28 regras determinísticas para Dockerfiles, compose, containers em execução, logs (força bruta, tentativas de ataque) e segredos no repositório. Não precisa do modelo e serve como trava de CI.
+- **Dois modelos (opcional):** um modelo rápido investiga com ferramentas de leitura; um modelo pesado confere as evidências, explica o problema e escreve a correção.
 - **Corrige pelo git:** cada correção é um commit numa branch própria `agent/...`. Seus arquivos não mudam até você rodar `/apply`, ou você roda `/pr` para abrir um pull request.
 - **Privado por padrão:** o modelo roda no seu Ollama, então logs e código não saem da sua rede.
 - **Seguro:**
@@ -24,7 +26,9 @@ Agente autônomo de DevOps que **depura** seus containers e seu projeto com um *
 
 1. [Início rápido](#início-rápido)
 2. [Depuração](#depuração)
-3. [Comandos do chat](#comandos-do-chat)
+3. [Auditoria de segurança](#auditoria-de-segurança)
+4. [Dois modelos](#dois-modelos)
+5. [Comandos do chat](#comandos-do-chat)
 4. [Propostas de mudança (fluxo git)](#propostas-de-mudança-fluxo-git)
 5. [Arquitetura](#arquitetura)
 6. [Referência dos módulos](#referência-dos-módulos)
@@ -99,6 +103,64 @@ Os incidentes encontrados pelo `check`/`watch` seguem o mesmo caminho: diagnóst
 
 ---
 
+## Auditoria de segurança
+
+O `devops-agent audit` verifica o projeto e os containers em execução com **28 regras**. Não precisa do modelo nem do Ollama, roda em segundos e serve como trava de CI. Cada achado tem o código da regra, a severidade, o local, a evidência (com segredos sempre redigidos) e como corrigir.
+
+```bash
+devops-agent audit                         # tabela no terminal
+devops-agent audit --fail-on medium        # código de saída 1 se houver algo médio ou pior
+devops-agent audit --json --no-docker      # saída para CI (sempre em UTF-8)
+```
+
+| Área | Regras |
+|---|---|
+| Dockerfile | DF001 imagem base sem versão fixa · DF002 roda como root · DF003 `curl \| sh` · DF004 segredo em `ENV`/`ARG` · DF005 contexto inteiro copiado sem `.dockerignore` · DF006 sem `HEALTHCHECK` · DF007 `apt-get` sem `--no-install-recommends` · DF008 `chmod 777` |
+| docker-compose | DC001 privilegiado · DC002 socket do Docker montado · DC003 segredo em `environment` · DC004 banco publicado em todas as interfaces · DC005 imagem sem versão fixa · DC006 rede do host · DC007 portas sem healthcheck · DC008 sem limite de memória |
+| Containers em execução | RC001 privilegiado · RC002 socket do Docker montado · RC003 banco em todas as interfaces · RC004 roda como root · RC005 rede do host · RC006 sem limite de memória |
+| Logs (containers e `*.log` do projeto) | LG001 força bruta (≥ 10 falhas de autenticação, com os IPs de origem mais frequentes) · LG002 tentativas de ataque (path traversal, SQL injection, scanners) · LG003 segredo impresso em texto puro |
+| Repositório | SC001 segredo fixo no código · SC002 arquivo de segredos commitado · SC003 arquivo de segredos fora do `.gitignore` |
+
+- **Severidades e códigos de saída:** os achados são `high`, `medium` ou `low`. O comando sai com 0 quando nada atinge o `--fail-on` (padrão `high`), com 1 quando algo atinge, e com 2 quando o workspace não existe.
+- **No chat:** o `/audit [foco]` (`/auditar`) roda a mesma auditoria pelo modelo. Ele explica os achados altos e médios no formato *Problema → Erro → Causa → Como resolver*, aponta falsos positivos e propõe correções nos arquivos com `propose_change`.
+- **Menos falsos positivos, de propósito:**
+  - a redação mascara com folga, mas, para *acusar* um segredo, exige um formato conhecido de token ou um literal plausível (8+ caracteres, sem espaços, e que não seja referência `${VAR}`, caminho, expressão de código ou texto de exemplo);
+  - testes, fixtures e documentação não são varridos em busca de segredos;
+  - arquivos de segredo são listados pelo nome e nunca lidos;
+  - os padrões de nome de arquivo diferenciam maiúsculas de minúsculas em qualquer sistema.
+- **Este repositório se audita no CI** com `--fail-on high`.
+
+---
+
+## Dois modelos
+
+Defina `AGENT_FAST_MODEL` (ou `--fast-model`) e o trabalho de investigação passa a rodar em duas etapas, como um engenheiro júnior que investiga e um sênior que decide:
+
+```mermaid
+flowchart LR
+    T["Tarefa<br/>/debug, /audit, /suggest, incidentes"] --> A["Modelo rápido<br/>ferramentas de leitura"]
+    A -- "relatório: sintomas, evidências (arquivo:linha),<br/>causa suspeita, arquivos envolvidos" --> R["Modelo pesado<br/>todas as ferramentas"]
+    R --> O["Problema → Erro → Causa → Como resolver<br/>+ proposta de mudança"]
+```
+
+| Etapa | Modelo | Ferramentas | Saída |
+|---|---|---|---|
+| Investigação | `AGENT_FAST_MODEL` | Só leitura: diagnóstico, auditoria, logs, inspect, arquivos, git. Sem `propose_change` e sem ações em containers | Relatório com *Sintomas*, *Evidências*, *Causa suspeita*, *Arquivos envolvidos* e *Dúvidas em aberto*, num painel discreto |
+| Resolução | `AGENT_MODEL` | Todas | O diagnóstico final e a proposta de correção |
+
+- **Onde vale:** `debug`, `/debug`, `/audit`, `/suggest` e os incidentes do `check`/`watch`. A conversa livre, o `ask` e o `/explain` vão direto ao modelo principal, para responder mais rápido.
+- **Evidência primeiro:** o investigador precisa usar ferramentas antes de relatar, e o resolvedor confere as evidências principais e lê um arquivo antes de alterá-lo.
+- **Opcional:** sem `AGENT_FAST_MODEL`, um modelo faz tudo, como antes.
+- **Visível:** o preflight confere os dois modelos, o `/status` mostra os dois, as linhas no terminal levam o nome do modelo e os registros de auditoria têm `model` e `role` (`analyst` / `resolver`).
+
+| Hardware | Modelo rápido (investigação) | Modelo pesado (resolução) |
+|---|---|---|
+| Só CPU | `qwen3:1.7b` (num teste real, o `qwen2.5:1.5b` reuniu as evidências certas, mas tirou a conclusão errada) | `qwen3:4b` |
+| GPU com 8–12 GB | `qwen3:4b` | `qwen3:8b` ou `qwen3:14b` |
+| GPU com 24 GB ou mais | `qwen3:8b` | `qwen3:32b` |
+
+---
+
 ## Comandos do chat
 
 O `devops-agent chat` funciona como um assistente de código: você conversa com o agente e usa comandos com `/`. Todo comando tem nome em inglês e um apelido em português.
@@ -107,6 +169,7 @@ O `devops-agent chat` funciona como um assistente de código: você conversa com
 |---|---|---|
 | `/help` | `/ajuda` | Lista os comandos |
 | `/debug [foco]` | `/depurar` | Descobre o que está falhando (containers, logs, projeto), explica cada bug e propõe correções |
+| `/audit [foco]` | `/auditar` | Roda a auditoria de segurança; o agente explica os achados e propõe correções |
 | `/suggest [foco]` | `/sugerir` | Revisa o projeto e propõe **só as mudanças necessárias** (bugs, riscos de segurança, configuração errada) |
 | `/proposals` | `/propostas` | Lista as propostas pendentes |
 | `/diff [id]` | — | Mostra as alterações de uma proposta (padrão: a mais recente) |
@@ -175,11 +238,13 @@ flowchart LR
 devops_agent/
   cli.py           argumentos, preflight e comandos (chat, ask, debug, check, watch)
   commands.py      loop do chat e comandos /; sessões debug() e suggest()
-  agent.py         Agent: loop modelo → ferramenta → resultado
+  agent.py         Agent: loop modelo → ferramenta → resultado (papel: resolvedor ou investigador)
+  pipeline.py      Team: modelo rápido investiga, modelo pesado resolve
   tools.py         Tool, Toolbox e todas as ferramentas expostas ao modelo
   docker_tools.py  wrapper da CLI do Docker
   workspace.py     acesso restrito e só de leitura aos arquivos do projeto
   diagnostics.py   relatório determinístico (containers, arquivos de log, infraestrutura)
+  security/        auditoria de segurança: dockerfile, compose, runtime, logs, secrets, heuristics, audit
   git_tools.py     wrapper da CLI do git, incluindo commits por plumbing
   proposals.py     propostas: criar, diff, aplicar, pull request, descartar, desfazer
   monitor.py       Issue, Monitor e regras de detecção
@@ -203,7 +268,8 @@ demo/              containers com defeitos de propósito
 | `diagnostics.py` | `collect(workspace)`: containers com problema e suas últimas linhas de erro, arquivos de log do projeto com erros, arquivos de infraestrutura. |
 | `git_tools.py` | `_git` (lista de argumentos, sem shell, `GIT_TERMINAL_PROMPT=0`, bytes para preservar CRLF); `commit_files` (commit por plumbing com a identidade do agente); `merge`/`revert_merge` (abortam em conflito); `branches`, `read_blob`, `push`... **`GitError`**. |
 | `proposals.py` | **`ProposalStore`**: `create`, `pending`, `get`, `diff`, `apply`, `discard`, `undo_last`, `open_pull_request`. **`Proposal`**, **`Edit`**, `parse_edits` (aceita lista, dict ou string JSON), `apply_edit`. **`ProposalError`**. |
-| `commands.py` | **`Session`**, **`Command`**, `COMMANDS`, `dispatch`, `handle_input`, `run_chat`, `debug`, `suggest`, `ask_agent`. |
+| `commands.py` | **`Session`** (`agent` para o chat, `team` para os comandos de investigação), **`Command`**, `COMMANDS`, `dispatch`, `handle_input`, `run_chat`, `debug`, `suggest`, `security_review`, `ask_agent`. |
+| `pipeline.py` | **`Team`**: `run(task)` manda a tarefa ao investigador (modelo rápido), quando houver, e entrega o relatório dele ao resolvedor (modelo pesado); `reset()` limpa os dois. Protocolo **`Runner`** (`run`, `reset`), comum a `Agent` e `Team`. |
 | `tools.py` | **`Tool`**, **`Toolbox`**, `DOCKER_TOOLS`, `workspace_tools`, `diagnostics_tool`, `proposal_tool`, `build_toolbox`. |
 | `agent.py` | **`Agent`**: `run(task, require_evidence)` e passos privados pequenos (`_step`, `_execute`, `_approve`, `_invoke`...). Recebe uma `Toolbox`. |
 | `monitor.py`, `workers.py`, `redaction.py`, `audit.py`, `config.py`, `i18n.py`, `ui.py`, `docker_tools.py` | Responsabilidades de antes: regras, fila paralela, ocultação, auditoria, configuração, traduções, terminal e CLI do Docker. |
@@ -215,6 +281,7 @@ demo/              containers com defeitos de propósito
 | Ferramenta | O que faz | Aprovação |
 |---|---|---|
 | `collect_diagnostics()` | Ponto de partida: containers com problema, erros em arquivos de log, arquivos de infraestrutura | — |
+| `audit_security()` | A auditoria de segurança com 28 regras (veja [Auditoria de segurança](#auditoria-de-segurança)) | — |
 | `list_containers`, `inspect_container`, `get_container_logs`, `get_container_stats` | Leituras do Docker (o `inspect` mostra só os **nomes** das variáveis) | — |
 | `list_files(pattern?)` | Arquivos do projeto (respeita o `.gitignore`; esconde segredos; até 300) | — |
 | `read_file(path, start_line?, max_lines?)` | Arquivo com linhas numeradas (`12| `), até 500 linhas, máx. 512 KB, só texto | — |
@@ -299,7 +366,8 @@ Variáveis de ambiente ou um arquivo `.env` (copie o `.env.example`, que tem **s
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `AGENT_WORKSPACE` | diretório atual | Projeto que o agente depura e no qual propõe mudanças (um repositório git) |
-| `AGENT_MODEL` | `qwen3:4b` | Modelo do Ollama |
+| `AGENT_MODEL` | `qwen3:4b` | Modelo principal do Ollama (resolução e chat) |
+| `AGENT_FAST_MODEL` | vazio | Modelo mais rápido para a etapa de investigação; vazio = um modelo faz tudo |
 | `AGENT_LANGUAGE` | idioma do sistema | `en` ou `pt-BR` |
 | `AGENT_WORKERS` | `2` | Investigações em paralelo |
 | `AGENT_MAX_STEPS` | `12` | Máximo de rodadas modelo → ferramenta por tarefa |
@@ -310,7 +378,7 @@ Variáveis de ambiente ou um arquivo `.env` (copie o `.env.example`, que tem **s
 | `DOCKER_HOST` / `DOCKER_CONTEXT` | padrão do Docker | Qual daemon depurar |
 
 ```
-devops-agent [--model MODELO] [--lang en|pt-BR] {chat,ask,debug,check,watch} ...
+devops-agent [--model MODELO] [--fast-model MODELO] [--lang en|pt-BR] {chat,ask,debug,audit,check,watch} ...
 ```
 
 | Comando | Opções | Comportamento |
@@ -318,6 +386,7 @@ devops-agent [--model MODELO] [--lang en|pt-BR] {chat,ask,debug,check,watch} ...
 | `chat` | — | Sessão interativa com comandos `/` |
 | `ask PERGUNTA...` | — | Uma pergunta, uma resposta |
 | `debug [FOCO...]` | — | Sessão completa de depuração; mostra as propostas para revisar no chat |
+| `audit` | `--fail-on high\|medium\|low\|never`, `--json`, `--no-docker` | Auditoria de segurança sem o modelo; código de saída 1 quando um achado atinge o `--fail-on` |
 | `check` | `--only a,b`, `--scan-logs`, `--workers N` | Uma varredura; investiga cada incidente em paralelo |
 | `watch` | as mesmas, mais `--interval 30` e `--cooldown 600` | Varredura contínua |
 
@@ -388,6 +457,8 @@ Os testes de unidade **não precisam de Docker nem de Ollama**: usam dublês (`F
 | `test_git_tools.py` | Commits por plumbing que nunca tocam nos seus arquivos, identidade do agente, bit de executável, CRLF, merge/revert, conflitos abortados |
 | `test_proposals.py` | Edições exatas (única, ambígua, CRLF, números de linha), proteções contra segredos, workspace numa subpasta, aplicar/desfazer/descartar, push para um remoto, **ponta a ponta: o modelo propõe e o operador aplica** |
 | `test_diagnostics.py` | Containers com erros, Docker fora do ar, logs no `.gitignore`, logs enormes, arquivos de infraestrutura |
+| `test_pipeline.py` | O investigador recebe a tarefa com evidência obrigatória, o resolvedor recebe o relatório do investigador, o modo de um modelo não muda, o reset limpa os dois |
+| `test_security_*.py` | Cada regra da auditoria dispara num exemplo ruim e fica quieta num exemplo correto; falsos positivos achados e corrigidos (chaves de tradução, `os.environ[...]`, `${VAR}`, `dockerfile.py` no Windows); códigos de saída e JSON em UTF-8 |
 | `test_commands.py` | Todos os comandos e apelidos, `/debug`, `/suggest`, `/diff`, `/explain` (sem enviar segredos), confirmações de `/apply`, `/pr`, `/discard`, `/undo` |
 | `test_cli.py`, `test_workers.py`, `test_monitor.py`, `test_docker_tools.py`, `test_tools.py`, `test_redaction.py`, `test_config.py`, `test_i18n.py`, `test_audit.py` | CLI, fila paralela, regras e `ERROR_RE`, wrapper do Docker, toolbox, ocultação (inclusive referências `${VAR}`), `.env`, traduções, auditoria |
 
@@ -425,9 +496,9 @@ O `demo/docker-compose.yml` sobe quatro containers com defeitos conhecidos. Rode
 | Modelo | `demo-web-unhealthy` numa máquina só com CPU |
 |---|---|
 | `llama3.2:3b` | ❌ Inventou um OOM; uma vez escreveu uma saída de `docker inspect` inteira falsa |
-| `qwen3:4b` (padrão) | ✅ Achou a porta errada do healthcheck e viu que reiniciar não resolve; lento na CPU |
+| `qwen3:4b` (padrão) | ✅ Achou a porta errada do healthcheck e viu que reiniciar não resolve; numa sessão de `debug`, propôs sozinho a correção exata (`8081` → `80` no `docker-compose.yml`) numa branch própria; lento na CPU |
 
-Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. Com GPU, um modelo maior (como o `qwen3:8b` em diante) dá propostas muito melhores.
+Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. Com GPU, um modelo maior (como o `qwen3:8b` em diante) dá propostas muito melhores. Para a investigação continuar rápida, combine-o com um modelo pequeno em [Dois modelos](#dois-modelos).
 
 ---
 
@@ -465,7 +536,8 @@ Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. 
 - [ ] Modos de permissão (só sugerir / perguntar / automático) e políticas por ferramenta
 - [ ] Canais de aprovação com timeout (webhook, Slack, Telegram)
 - [ ] Provedores de LLM: qualquer API compatível com OpenAI (vLLM, LM Studio...)
-- [ ] Varredura de segurança nos logs (força bruta, acessos suspeitos) e nas configurações (portas expostas, containers como root, tag `latest`)
+- [x] Auditoria de segurança: Dockerfiles, compose, containers em execução, logs e segredos no repositório (`audit`, `/audit`)
+- [x] Dois modelos: um rápido investiga, um pesado resolve (`AGENT_FAST_MODEL`)
 - [ ] Estado persistente e fila distribuída
 - [ ] Vários hosts Docker, depois Kubernetes
 - [ ] `/health`, métricas Prometheus, API HTTP
