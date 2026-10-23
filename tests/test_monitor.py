@@ -112,13 +112,30 @@ def test_restart_rule_only_applies_to_running_containers(make_info):
         "Exception in thread main",
         "time=... level=error msg=boom",
         '{"level": "error", "msg": "boom"}',
+        "Error: connect ECONNREFUSED 127.0.0.1:5432",
+        "TypeError: Cannot read properties of undefined (reading 'id')",
+        "ValueError: invalid literal for int()",
+        "java.lang.RuntimeException: boom",
+        "Unhandled NullPointerException at Worker.run",
+        "Fatal: unable to access repository",
     ],
 )
 def test_error_regex_matches_common_error_lines(line):
     assert ERROR_RE.search(line)
 
 
-@pytest.mark.parametrize("line", ["GET /health 200", "error_count=0", "no errors found", "INFO started"])
+@pytest.mark.parametrize(
+    "line",
+    [
+        "GET /health 200",
+        "error_count=0",
+        "no errors found",
+        "INFO started",
+        "ErrorBoundary mounted",
+        "handled 0 exceptions",
+        "Exceptional performance today",
+    ],
+)
 def test_error_regex_ignores_normal_lines(line):
     assert not ERROR_RE.search(line)
 

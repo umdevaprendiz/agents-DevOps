@@ -12,7 +12,12 @@ from .i18n import t
 from .redaction import redact
 
 ERROR_RE = re.compile(
-    r"\b(ERROR|FATAL|CRITICAL|PANIC)\b|panic:|Traceback \(most recent call last\)|\bException\b|level=error|\"level\":\s*\"error\""
+    r"\b(?:ERROR|FATAL|CRITICAL|PANIC)\b"  # upper-case log levels
+    r"|\b\w*(?:Error|Fatal):"  # "Error: ...", "TypeError: ..." (Node.js, Python, Go CLIs)
+    r"|panic:"  # Go
+    r"|Traceback \(most recent call last\)"  # Python
+    r"|\b\w*Exception\b"  # "Exception", "RuntimeException", "NullPointerException"
+    r"|level=error|\"level\":\s*\"error\""  # structured logs
 )
 LOOP_MIN_RESTARTS = 3
 RECENT_START = timedelta(minutes=5)
