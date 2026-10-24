@@ -33,6 +33,8 @@ class Config:
     workers: int = field(default_factory=lambda: _env_int("AGENT_WORKERS", 2))
     max_steps: int = field(default_factory=lambda: _env_int("AGENT_MAX_STEPS", 12))
     num_ctx: int = field(default_factory=lambda: _env_int("AGENT_NUM_CTX", 8192))
+    # Most tokens one model reply may have: a small model stuck in a loop cannot hold a session for long.
+    num_predict: int = field(default_factory=lambda: _env_int("AGENT_NUM_PREDICT", 2048))
     max_tool_output: int = field(default_factory=lambda: _env_int("AGENT_MAX_TOOL_OUTPUT", 4000))
     audit_file: Path = field(default_factory=lambda: Path(_env("AGENT_AUDIT_FILE", "logs/audit.jsonl")))
     # Project the agent reads and proposes changes to (a git repository).

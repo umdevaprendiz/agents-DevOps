@@ -151,11 +151,15 @@ def _repository_rows(session: Session) -> list[tuple[str, str]]:
 
 # --- Debugging and suggestions (also used by the CLI) ---------------------------------------------------
 
+def debug_task(focus: str = "") -> str:
+    """The task /debug sends to the agent (the evaluation sends the same one)."""
+    return t("prompt.debug", target=focus or t("prompt.debug_everything"))
+
+
 def debug(runner: Runner, store: ProposalStore, focus: str = "") -> bool:
     """Full debugging session: find what fails, explain it and propose fixes.
     Returns True when new proposals were created."""
-    target = focus or t("prompt.debug_everything")
-    return _run_with_proposals(runner, store, t("prompt.debug", target=target))
+    return _run_with_proposals(runner, store, debug_task(focus))
 
 
 def suggest(runner: Runner, store: ProposalStore, focus: str = "") -> bool:

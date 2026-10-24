@@ -1,16 +1,21 @@
-"""Command line: chat, ask, check and watch."""
+"""Command line: chat, ask, debug, audit, eval, check and watch."""
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
+from typing import Iterator
 
 import ollama
+from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
 from . import docker_tools as dk
+from . import evaluation
 from . import git_tools as git
 from . import i18n
 from . import security
@@ -136,18 +141,30 @@ def _heartbeat(new: int, running: int, last: tuple[int, int] | None) -> tuple[in
     return snapshot
 
 
-def build_team(cfg: Config, audit: AuditLog, tools: Toolbox | None = None, label: str | None = None, progress=None) -> Team:
-    """The heavy model resolves; with AGENT_FAST_MODEL set, a fast read-only model investigates first."""
+def build_team(
+    cfg: Config,
+    audit: AuditLog,
+    tools: Toolbox | None = None,
+    label: str | None = None,
+    progress=None,
+    approver=None,
+    out: Console | None = None,
+    on_brief=None,
+) -> Team:
+    """The heavy model resolves; with AGENT_FAST_MODEL set, a fast read-only model investigates first.
+    The evaluation passes its own approver, output and report handler."""
     tools = tools or build_toolbox()
-    resolver = Agent(cfg, console, ask_approval, audit, label=label, progress=progress, tools=tools)
+    approver, out = approver or ask_approval, out or console
+    resolver = Agent(cfg, out, approver, audit, label=label, progress=progress, tools=tools)
     if not cfg.fast_model:
         return Team(resolver)
     analyst_label = f"{label} · {cfg.fast_model}" if label else cfg.fast_model
     analyst = Agent(
-        cfg, console, ask_approval, audit, label=analyst_label, progress=progress,
+        cfg, out, approver, audit, label=analyst_label, progress=progress,
         tools=tools.read_only(), model=cfg.fast_model, role=ANALYST,
     )
-    return Team(resolver, analyst, on_brief=lambda brief: show_brief(brief, cfg.fast_model, label))
+    on_brief = on_brief or (lambda brief: show_brief(brief, cfg.fast_model, label))
+    return Team(resolver, analyst, on_brief=on_brief)
 
 
 def build_investigator(cfg: Config, audit: AuditLog, tools: Toolbox | None = None) -> Investigator:
@@ -204,6 +221,108 @@ def _finding_cells(finding: security.Finding) -> tuple[str, str, str, str]:
     return f"[{style}]{security.severity_label(finding.severity)}[/]", finding.rule.id, escape(finding.location), problem
 
 
+# --- Model evaluation (simulated scenarios: no Docker, no project needed) --------------------------------
+
+def run_eval(cfg: Config, args: argparse.Namespace) -> int:
+    """Exit code 0 = done, 1 = setup failed or the pass rate is below --fail-under, 2 = invalid scenarios."""
+    with _human_output(to_stderr=args.json):
+        try:
+            scenarios = evaluation.select(evaluation.load_scenarios(args.scenarios_dir), args.scenario)
+        except evaluation.ScenarioError as error:
+            show_error(t("eval.invalid"), str(error))
+            return 2
+        if args.list:
+            evaluation.show_scenarios(console, scenarios)
+            return 0
+        if not _check_git():
+            return 1
+        if args.validate:
+            return _run_validation(scenarios)
+        if not _check_ollama(cfg):
+            return 1
+        return _run_models(cfg, args, scenarios)
+
+
+def _run_models(cfg: Config, args: argparse.Namespace, scenarios: list[evaluation.Scenario]) -> int:
+    repeat = max(1, args.repeat)
+    results = evaluation.evaluate(
+        scenarios,
+        eval_team_factory(cfg, args.verbose),
+        repeat,
+        progress=_eval_progress(len(scenarios), repeat),
+        on_result=lambda result: evaluation.show_run(console, result),
+    )
+    if args.json:
+        models = {"resolver": cfg.model, "analyst": cfg.fast_model}
+        _write_utf8(evaluation.as_json(results, models, cfg.language, repeat) + "\n")
+    else:
+        evaluation.show_results(console, results, evaluation.models_label(cfg.model, cfg.fast_model), repeat)
+    return _threshold_exit(results, args.fail_under)
+
+
+def eval_team_factory(cfg: Config, verbose: bool) -> evaluation.TeamFactory:
+    """The same agents as /debug, but container actions are refused and nothing is printed unless --verbose."""
+    out = console if verbose else Console(quiet=True)
+
+    def make(scenario, tools, events, on_brief) -> Team:
+        def brief(text: str) -> None:
+            on_brief(text)
+            if verbose:
+                show_brief(text, cfg.fast_model, scenario.id)
+
+        label = scenario.id if verbose else None
+        return build_team(cfg, events, tools, label=label, approver=evaluation.deny_actions, out=out, on_brief=brief)
+
+    return make
+
+
+def _eval_progress(total: int, repeat: int):
+    order: dict[str, int] = {}
+
+    def progress(scenario: evaluation.Scenario, attempt: int):
+        index = order.setdefault(scenario.id, len(order) + 1)
+        return spinner(evaluation.run_label(scenario, attempt, repeat, index, total))
+
+    return progress
+
+
+def _threshold_exit(results: list[evaluation.RunResult], fail_under: float | None) -> int:
+    if fail_under is None:
+        return 0
+    rate = evaluation.summarize("total", results).passed.percent
+    if rate < fail_under:
+        show_error(t("eval.below_threshold", rate=rate, threshold=fail_under))
+        return 1
+    return 0
+
+
+def _run_validation(scenarios: list[evaluation.Scenario]) -> int:
+    with spinner(t("eval.validating")):
+        validations = evaluation.validate(scenarios)
+    evaluation.show_validation(console, validations)
+    return 0 if all(item.ok for item in validations) else 1
+
+
+def _check_git() -> bool:
+    if shutil.which("git"):
+        return True
+    show_error(t("eval.git_missing"))
+    return False
+
+
+@contextmanager
+def _human_output(to_stderr: bool) -> Iterator[None]:
+    """With --json, terminal messages go to stderr so stdout carries only the JSON."""
+    if not to_stderr:
+        yield
+        return
+    previous, console.file = console.file, sys.stderr
+    try:
+        yield
+    finally:
+        console.file = previous
+
+
 # --- Arguments -----------------------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,6 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ask", help=t("cli.help.ask")).add_argument("question", nargs="+")
     sub.add_parser("debug", help=t("cli.help.debug")).add_argument("focus", nargs="*", help=t("cli.help.focus"))
     _add_audit_options(sub.add_parser("audit", help=t("cli.help.audit")))
+    _add_eval_options(sub.add_parser("eval", help=t("cli.help.eval")))
     _add_monitor_options(sub.add_parser("check", help=t("cli.help.check")))
     _add_watch_options(sub.add_parser("watch", help=t("cli.help.watch")))
     return parser
@@ -227,6 +347,17 @@ def _add_audit_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fail-on", choices=choices, default="high", help=t("cli.help.fail_on"))
     parser.add_argument("--json", action="store_true", help=t("cli.help.json"))
     parser.add_argument("--no-docker", action="store_true", help=t("cli.help.no_docker"))
+
+
+def _add_eval_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--scenario", action="append", metavar="ID", help=t("cli.help.scenario"))
+    parser.add_argument("--scenarios-dir", metavar="DIR", help=t("cli.help.scenarios_dir"))
+    parser.add_argument("--repeat", type=int, default=1, help=t("cli.help.repeat"))
+    parser.add_argument("--fail-under", type=float, metavar="PCT", help=t("cli.help.fail_under_rate"))
+    parser.add_argument("--json", action="store_true", help=t("cli.help.eval_json"))
+    parser.add_argument("--verbose", action="store_true", help=t("cli.help.verbose"))
+    parser.add_argument("--list", action="store_true", help=t("cli.help.list"))
+    parser.add_argument("--validate", action="store_true", help=t("cli.help.validate"))
 
 
 def _add_monitor_options(parser: argparse.ArgumentParser) -> None:
@@ -305,6 +436,15 @@ def _run_debug(team: Team, proposals: ProposalStore, focus_words: list[str]) -> 
         show_dim(t("cli.review_in_chat"))
 
 
+def _interruptible(command, cfg: Config, args: argparse.Namespace) -> int:
+    """Ctrl+C stops the command cleanly (temporary folders are removed by their context managers)."""
+    try:
+        return command(cfg, args)
+    except KeyboardInterrupt:
+        show_dim(t("cli.stopped"))
+        return 130
+
+
 def main(argv: list[str] | None = None) -> int:
     load_env_file()
     cfg = Config()
@@ -313,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
     _apply_overrides(cfg, args)
     if args.command == "audit":
         return run_audit(cfg, args)
+    if args.command == "eval":
+        return _interruptible(run_eval, cfg, args)
     if not preflight(cfg):
         return 1
     try:

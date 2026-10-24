@@ -203,7 +203,7 @@ class Agent:
         kwargs = {
             "model": self.model,
             "messages": self.messages,
-            "options": {"temperature": TEMPERATURE, "num_ctx": self.cfg.num_ctx},
+            "options": {"temperature": TEMPERATURE, "num_ctx": self.cfg.num_ctx, "num_predict": self.cfg.num_predict},
         }
         if with_tools:
             kwargs["tools"] = self.tools.schemas
@@ -212,15 +212,22 @@ class Agent:
         return kwargs
 
     def _chat(self, kwargs: dict):
+        response = self._send(kwargs)
+        if getattr(response, "done_reason", None) == "length":
+            self._print(f"[yellow]{escape(t('agent.reply_cut', tokens=self.cfg.num_predict))}[/]")
+            self._audit("reply_cut", tokens=self.cfg.num_predict, model=self.model)
+        return response.message
+
+    def _send(self, kwargs: dict):
         try:
-            return self.client.chat(**kwargs).message
+            return self.client.chat(**kwargs)
         except ollama.ResponseError as error:
             if not self._think_unsupported(error, kwargs):
                 raise
             # The model has no "think" support: retry without the parameter.
             self._send_think = False
             kwargs.pop("think")
-            return self.client.chat(**kwargs).message
+            return self.client.chat(**kwargs)
 
     @staticmethod
     def _think_unsupported(error: Exception, kwargs: dict) -> bool:

@@ -158,6 +158,21 @@ def has_remote(root: Path, remote: str = "origin") -> bool:
     return remote in _git(root, ["remote"]).split()
 
 
+# --- New repositories (the evaluation builds one per scenario) -----------------------------------------
+
+def init(root: Path, branch: str = "main", config: dict[str, str] | None = None) -> None:
+    _git(root, ["init", "-q", "-b", branch])
+    for key, value in (config or {}).items():
+        _git(root, ["config", key, value])
+
+
+def commit_all(root: Path, message: str) -> str:
+    """Commits every file in the folder; returns the commit hash."""
+    _git(root, ["add", "-A"])
+    _git(root, ["commit", "-q", "--allow-empty", "-m", message])
+    return head_commit(root)
+
+
 # --- Agent commits (plumbing: never touches the working tree) ------------------------------------------
 
 def commit_files(root: Path, base: str, files: dict[str, str], message: str) -> str:

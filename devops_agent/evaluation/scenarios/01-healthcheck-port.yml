@@ -1,0 +1,70 @@
+# nginx works on port 80, but the healthcheck calls 8081, so Docker marks the container unhealthy.
+id: healthcheck-port
+title:
+  en: Healthcheck calls the wrong port
+  pt-BR: Healthcheck chama a porta errada
+focus: web
+
+files:
+  docker-compose.yml: |
+    services:
+      web:
+        image: nginx:1.27-alpine
+        ports:
+          - "127.0.0.1:8080:80"
+        volumes:
+          - ./site:/usr/share/nginx/html:ro
+        healthcheck:
+          test: ["CMD", "wget", "-qO-", "http://localhost:8081/"]
+          interval: 10s
+          timeout: 3s
+          retries: 3
+        mem_limit: 128m
+        restart: unless-stopped
+  site/index.html: |
+    <!doctype html>
+    <title>Shop</title>
+    <h1>It works</h1>
+
+containers:
+  - name: web
+    image: nginx:1.27-alpine
+    restart_policy: unless-stopped
+    memory_mb: 128
+    healthcheck: ["CMD", "wget", "-qO-", "http://localhost:8081/"]
+    health: unhealthy
+    health_log:
+      - "wget: can't connect to remote host (127.0.0.1): Connection refused"
+      - "wget: can't connect to remote host (127.0.0.1): Connection refused"
+      - "wget: can't connect to remote host (127.0.0.1): Connection refused"
+    ports:
+      80/tcp: ["127.0.0.1:8080"]
+    mounts: ["/srv/shop/site:/usr/share/nginx/html"]
+    command: ["nginx", "-g", "daemon off;"]
+    entrypoint: ["/docker-entrypoint.sh"]
+    env: [PATH, NGINX_VERSION]
+    logs: |
+      /docker-entrypoint.sh: Configuration complete; ready for start up
+      2026/10/23 18:00:01 [notice] 1#1: using the "epoll" event method
+      2026/10/23 18:00:01 [notice] 1#1: nginx/1.27.2
+      2026/10/23 18:00:01 [notice] 1#1: start worker processes
+      172.18.0.1 - - [23/Oct/2026:18:02:10 +0000] "GET / HTTP/1.1" 200 61 "-" "curl/8.5.0"
+      172.18.0.1 - - [23/Oct/2026:18:05:44 +0000] "GET / HTTP/1.1" 200 61 "-" "Mozilla/5.0"
+
+expect:
+  diagnosis:
+    - ["8081"]
+  fix:
+    - docker-compose.yml:
+        contains: ['re:https?://(localhost|127\.0\.0\.1)(:80)?/']
+        absent: ["8081"]
+
+reference:
+  title: Point the healthcheck at port 80
+  answer: >-
+    The healthcheck of web calls http://localhost:8081/, but nginx listens on port 80
+    (the container exposes 80/tcp and every health check ends with "Connection refused").
+  edits:
+    - path: docker-compose.yml
+      old_text: "http://localhost:8081/"
+      new_text: "http://localhost:80/"

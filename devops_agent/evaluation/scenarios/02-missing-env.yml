@@ -1,0 +1,123 @@
+# The api exits at startup because docker-compose.yml never passes DATABASE_URL to it.
+id: missing-env
+title:
+  en: API crashes because DATABASE_URL is missing
+  pt-BR: API cai porque falta a DATABASE_URL
+focus: api
+
+files:
+  docker-compose.yml: |
+    services:
+      api:
+        build: ./api
+        restart: unless-stopped
+        environment:
+          PORT: "3000"
+          LOG_LEVEL: info
+        ports:
+          - "127.0.0.1:3000:3000"
+        mem_limit: 256m
+        depends_on:
+          - db
+      db:
+        image: postgres:16-alpine
+        environment:
+          POSTGRES_DB: shop
+          POSTGRES_USER: shop
+          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+        volumes:
+          - db-data:/var/lib/postgresql/data
+        mem_limit: 512m
+    volumes:
+      db-data:
+  api/Dockerfile: |
+    FROM node:22-alpine
+    WORKDIR /app
+    COPY package.json ./
+    RUN npm install --omit=dev
+    COPY . .
+    USER node
+    CMD ["node", "server.js"]
+  api/package.json: |
+    {
+      "name": "shop-api",
+      "version": "1.0.0",
+      "main": "server.js",
+      "dependencies": {
+        "pg": "^8.13.0"
+      }
+    }
+  api/server.js: |
+    const http = require("http");
+    const { Pool } = require("pg");
+
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl) {
+      console.error("Error: DATABASE_URL is not set");
+      process.exit(1);
+    }
+
+    const pool = new Pool({ connectionString: databaseUrl });
+    const port = Number(process.env.PORT || 3000);
+
+    http.createServer(async (req, res) => {
+      const { rows } = await pool.query("SELECT now() AS now");
+      res.end(JSON.stringify(rows[0]));
+    }).listen(port, () => console.log(`api listening on ${port}`));
+  .env.example: |
+    POSTGRES_PASSWORD=
+
+containers:
+  - name: api
+    image: shop-api:latest
+    state: restarting
+    exit_code: 1
+    restart_count: 9
+    restart_policy: unless-stopped
+    memory_mb: 256
+    user: node
+    command: ["node", "server.js"]
+    env: [PORT, LOG_LEVEL, PATH, NODE_VERSION]
+    ports:
+      3000/tcp: ["127.0.0.1:3000"]
+    logs: |
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+      Error: DATABASE_URL is not set
+  - name: db
+    image: postgres:16-alpine
+    memory_mb: 512
+    user: postgres
+    env: [POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD, PGDATA, PATH]
+    ports:
+      5432/tcp: []
+    mounts: ["db-data:/var/lib/postgresql/data"]
+    logs: |
+      PostgreSQL init process complete; ready for start up.
+      2026-10-23 18:00:03.120 UTC [1] LOG:  starting PostgreSQL 16.4 on x86_64-pc-linux-musl
+      2026-10-23 18:00:03.131 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+      2026-10-23 18:00:03.150 UTC [1] LOG:  database system is ready to accept connections
+
+expect:
+  diagnosis:
+    - ["DATABASE_URL"]
+  fix:
+    - docker-compose.yml:
+        contains: ["DATABASE_URL"]
+
+reference:
+  title: Pass DATABASE_URL to the api
+  answer: >-
+    api exits with code 1 and restarts in a loop: its log says "Error: DATABASE_URL is not set", and
+    docker-compose.yml does not give DATABASE_URL to the api service. Build it from the db settings,
+    with the password coming from POSTGRES_PASSWORD.
+  edits:
+    - path: docker-compose.yml
+      old_text: "      LOG_LEVEL: info\n"
+      new_text: "      LOG_LEVEL: info\n      DATABASE_URL: postgres://shop:${POSTGRES_PASSWORD}@db:5432/shop\n"

@@ -8,6 +8,7 @@ Agente autônomo de DevOps que **depura** seus containers e seu projeto com um *
 - **Explica como um engenheiro:** cada problema vem como *Problema → Erro → Causa → Como resolver → Mudança proposta*.
 - **Audita a segurança:** 28 regras determinísticas para Dockerfiles, compose, containers em execução, logs (força bruta, tentativas de ataque) e segredos no repositório. Não precisa do modelo e serve como trava de CI.
 - **Dois modelos (opcional):** um modelo rápido investiga com ferramentas de leitura; um modelo pesado confere as evidências, explica o problema e escreve a correção.
+- **Mensurável:** o `devops-agent eval` dá nota aos modelos em cenários simulados com bugs conhecidos (diagnóstico, correção, mudanças inventadas), sem precisar de Docker.
 - **Corrige pelo git:** cada correção é um commit numa branch própria `agent/...`. Seus arquivos não mudam até você rodar `/apply`, ou você roda `/pr` para abrir um pull request.
 - **Privado por padrão:** o modelo roda no seu Ollama, então logs e código não saem da sua rede.
 - **Seguro:**
@@ -28,27 +29,28 @@ Agente autônomo de DevOps que **depura** seus containers e seu projeto com um *
 2. [Depuração](#depuração)
 3. [Auditoria de segurança](#auditoria-de-segurança)
 4. [Dois modelos](#dois-modelos)
-5. [Comandos do chat](#comandos-do-chat)
-4. [Propostas de mudança (fluxo git)](#propostas-de-mudança-fluxo-git)
-5. [Arquitetura](#arquitetura)
-6. [Referência dos módulos](#referência-dos-módulos)
-7. [Ferramentas expostas ao modelo](#ferramentas-expostas-ao-modelo)
-8. [Regras do monitor](#regras-do-monitor)
-9. [Loop do agente](#loop-do-agente)
-10. [Investigações em paralelo](#investigações-em-paralelo)
-11. [Segurança](#segurança)
-12. [Configuração](#configuração)
-13. [Idiomas](#idiomas)
-14. [Rodando no Docker](#rodando-no-docker)
-15. [Log de auditoria](#log-de-auditoria)
-16. [Testes](#testes)
-17. [Ambiente de demonstração](#ambiente-de-demonstração)
-18. [Como estender](#como-estender)
-19. [Escolhendo o modelo](#escolhendo-o-modelo)
-20. [Convenções de código](#convenções-de-código)
-21. [Limitações conhecidas](#limitações-conhecidas)
-22. [Roadmap](#roadmap)
-23. [Como contribuir](#como-contribuir)
+5. [Avaliação dos modelos](#avaliação-dos-modelos)
+6. [Comandos do chat](#comandos-do-chat)
+7. [Propostas de mudança (fluxo git)](#propostas-de-mudança-fluxo-git)
+8. [Arquitetura](#arquitetura)
+9. [Referência dos módulos](#referência-dos-módulos)
+10. [Ferramentas expostas ao modelo](#ferramentas-expostas-ao-modelo)
+11. [Regras do monitor](#regras-do-monitor)
+12. [Loop do agente](#loop-do-agente)
+13. [Investigações em paralelo](#investigações-em-paralelo)
+14. [Segurança](#segurança)
+15. [Configuração](#configuração)
+16. [Idiomas](#idiomas)
+17. [Rodando no Docker](#rodando-no-docker)
+18. [Log de auditoria](#log-de-auditoria)
+19. [Testes](#testes)
+20. [Ambiente de demonstração](#ambiente-de-demonstração)
+21. [Como estender](#como-estender)
+22. [Escolhendo o modelo](#escolhendo-o-modelo)
+23. [Convenções de código](#convenções-de-código)
+24. [Limitações conhecidas](#limitações-conhecidas)
+25. [Roadmap](#roadmap)
+26. [Como contribuir](#como-contribuir)
 
 ---
 
@@ -74,6 +76,7 @@ devops-agent --lang pt-BR debug    # descobre o que falha, explica e propõe cor
 devops-agent debug api timeout     # o mesmo, com foco num container, arquivo ou sintoma
 devops-agent chat                  # interativo: /depurar, /diff, /explicar, /aplicar, /pr...
 devops-agent watch --scan-logs     # monitora os containers e investiga incidentes
+devops-agent eval                  # dá nota ao seu modelo em bugs simulados (sem Docker)
 ```
 
 ---
@@ -161,6 +164,52 @@ flowchart LR
 
 ---
 
+## Avaliação dos modelos
+
+O `devops-agent eval` mede o quanto um modelo, ou um par de modelos, depura bem. Ele roda o agente em cenários com bugs conhecidos, exatamente como o `/debug` faria, e dá nota ao que ele fez.
+
+```bash
+devops-agent eval                                    # todos os cenários que vêm com o agente, com o AGENT_MODEL
+devops-agent --model qwen3:8b --fast-model qwen3:1.7b eval --repeat 3
+devops-agent eval --scenario oom-killed --verbose    # um cenário, mostrando cada passo
+devops-agent eval --json > resultados.json           # para máquinas, para comparar modelos
+devops-agent eval --validate                         # confere os próprios cenários (sem modelo)
+```
+
+- **Não precisa de Docker nem de projeto:** cada cenário ganha um repositório git temporário com os arquivos dele e um **Docker simulado** com os containers dele. A simulação responde aos mesmos comandos `docker` do daemon de verdade (`ps`, `inspect`, `logs`, `stats`), então o monitor, o diagnóstico, a auditoria de segurança e todas as ferramentas rodam sem mudança. Seus containers e arquivos nunca são tocados.
+- **O mesmo fluxo do `/debug`:** o mesmo prompt, as mesmas ferramentas e a mesma dupla de modelos. Ações em containers são sempre negadas, e contadas.
+- **Leve na memória:** os cenários rodam um depois do outro.
+
+| Cenário | Bug | Avaliado |
+|---|---|---|
+| `healthcheck-port` | O healthcheck chama a porta 8081, mas o nginx escuta na 80 | Diagnóstico, correção |
+| `missing-env` | A api sai porque a `DATABASE_URL` nunca é passada para ela | Diagnóstico, correção |
+| `missing-entrypoint` | A imagem executa `main.py`, mas o código está em `worker.py` | Diagnóstico, correção |
+| `oom-killed` | Código de saída 137: 200.000 linhas carregadas num container de 64 MB | Diagnóstico, correção |
+| `healthy-stack` | Nenhum (cenário de controle) | Não propor nada |
+
+| Nota | Como é medida |
+|---|---|
+| **Diagnóstico** | A resposta, ou o título e a explicação de uma proposta, cita a causa. Procura palavras-chave técnicas que valem nos dois idiomas, como `8081` ou `DATABASE_URL` |
+| **Correção** | As propostas são aplicadas numa cópia, na ordem em que foram criadas, e os arquivos resultantes são conferidos (ex.: o healthcheck aponta para a porta 80 e o `8081` sumiu). Qualquer correção válida conta: no `oom-killed`, um limite maior ou um lote menor |
+| **Sem mudanças** | No cenário saudável qualquer proposta reprova, o que mede o quanto o modelo inventa correções |
+| **Analista** | Só no modo de dois modelos: se o relatório do modelo rápido já citava a causa |
+| Ferramentas, negadas, tempo | Média de chamadas de ferramenta, ações em containers tentadas e segundos por execução |
+
+- **Passa ou reprova:** uma execução passa quando todos os itens avaliados passam.
+- **Consistência:** o `--repeat N` mostra o quanto o modelo é consistente (ex.: `2/3`).
+- **Trava de CI:** o `--fail-under 80` transforma a taxa de acerto em código de saída.
+
+**Seus próprios cenários:** `eval --scenarios-dir meus-cenarios/` carrega arquivos YAML no mesmo formato [dos que vêm com o agente](devops_agent/evaluation/scenarios/):
+- `files`: o projeto;
+- `containers`: estado, código de saída, OOM, saúde, logs...;
+- `expect`: grupos de `diagnosis`, opções de `fix` com `contains`/`absent`, ou `no_changes`. Padrões que começam com `re:` são expressões regulares;
+- `reference`: a solução que um agente perfeito daria.
+
+O `eval --validate` confere se cada cenário passa com a referência e reprova quando o agente não faz nada. O CI roda isso em todo push.
+
+---
+
 ## Comandos do chat
 
 O `devops-agent chat` funciona como um assistente de código: você conversa com o agente e usa comandos com `/`. Todo comando tem nome em inglês e um apelido em português.
@@ -236,7 +285,7 @@ flowchart LR
 
 ```
 devops_agent/
-  cli.py           argumentos, preflight e comandos (chat, ask, debug, check, watch)
+  cli.py           argumentos, preflight e comandos (chat, ask, debug, audit, eval, check, watch)
   commands.py      loop do chat e comandos /; sessões debug() e suggest()
   agent.py         Agent: loop modelo → ferramenta → resultado (papel: resolvedor ou investigador)
   pipeline.py      Team: modelo rápido investiga, modelo pesado resolve
@@ -245,6 +294,7 @@ devops_agent/
   workspace.py     acesso restrito e só de leitura aos arquivos do projeto
   diagnostics.py   relatório determinístico (containers, arquivos de log, infraestrutura)
   security/        auditoria de segurança: dockerfile, compose, runtime, logs, secrets, heuristics, audit
+  evaluation/      avaliação dos modelos: cenários (YAML), Docker simulado, execução, notas e relatório
   git_tools.py     wrapper da CLI do git, incluindo commits por plumbing
   proposals.py     propostas: criar, diff, aplicar, pull request, descartar, desfazer
   monitor.py       Issue, Monitor e regras de detecção
@@ -271,6 +321,7 @@ demo/              containers com defeitos de propósito
 | `commands.py` | **`Session`** (`agent` para o chat, `team` para os comandos de investigação), **`Command`**, `COMMANDS`, `dispatch`, `handle_input`, `run_chat`, `debug`, `suggest`, `security_review`, `ask_agent`. |
 | `pipeline.py` | **`Team`**: `run(task)` manda a tarefa ao investigador (modelo rápido), quando houver, e entrega o relatório dele ao resolvedor (modelo pesado); `reset()` limpa os dois. Protocolo **`Runner`** (`run`, `reset`), comum a `Agent` e `Team`. |
 | `tools.py` | **`Tool`**, **`Toolbox`**, `DOCKER_TOOLS`, `workspace_tools`, `diagnostics_tool`, `proposal_tool`, `build_toolbox`. |
+| `evaluation/` | **`Scenario`** (`load_scenarios`, `select`, `parse`); **`SimulatedDocker`** (responde `ps`, `inspect`, `logs`, `stats`; instalado com `docker_tools.use_backend`, por thread); **`Environment`** (repositório git temporário + Docker simulado); `evaluate` e `run_scenario` (a tarefa do `/debug`, com nota); **`RunResult`**, `summarize`, `as_json`; `validate` (solução de referência contra não fazer nada). |
 | `agent.py` | **`Agent`**: `run(task, require_evidence)` e passos privados pequenos (`_step`, `_execute`, `_approve`, `_invoke`...). Recebe uma `Toolbox`. |
 | `monitor.py`, `workers.py`, `redaction.py`, `audit.py`, `config.py`, `i18n.py`, `ui.py`, `docker_tools.py` | Responsabilidades de antes: regras, fila paralela, ocultação, auditoria, configuração, traduções, terminal e CLI do Docker. |
 
@@ -319,7 +370,7 @@ O `ERROR_RE` reconhece:
 ## Loop do agente
 
 1. **Início:** adiciona a tarefa, corta o histórico antigo e registra `task` na auditoria.
-2. **Rodada:** chama o `chat` com a toolbox, `temperature=0.1`, `num_ctx` e `think=False`, e remove qualquer raciocínio, inclusive o do qwen3, que termina num `</think>` sem abertura.
+2. **Rodada:** chama o `chat` com a toolbox, `temperature=0.1`, `num_ctx`, `num_predict` e `think=False`, e remove qualquer raciocínio, inclusive o do qwen3, que termina num `</think>` sem abertura.
 3. **Chamadas de ferramenta:** usa os `tool_calls` nativos; se não houver, procura uma chamada em JSON escrita no texto e só aceita nomes de ferramentas conhecidos.
 4. **Execução:**
    - Ferramenta desconhecida devolve a lista das válidas.
@@ -372,6 +423,7 @@ Variáveis de ambiente ou um arquivo `.env` (copie o `.env.example`, que tem **s
 | `AGENT_WORKERS` | `2` | Investigações em paralelo |
 | `AGENT_MAX_STEPS` | `12` | Máximo de rodadas modelo → ferramenta por tarefa |
 | `AGENT_NUM_CTX` | `8192` | Janela de contexto pedida ao Ollama |
+| `AGENT_NUM_PREDICT` | `2048` | Máximo de tokens por resposta do modelo. Um modelo pequeno preso num laço é cortado aqui, em vez de prender a sessão por muitos minutos |
 | `AGENT_MAX_TOOL_OUTPUT` | `4000` | Máximo de caracteres de cada saída de ferramenta |
 | `AGENT_AUDIT_FILE` | `logs/audit.jsonl` | Caminho do log de auditoria |
 | `OLLAMA_HOST` | `http://localhost:11434` | Servidor do Ollama |
@@ -460,11 +512,13 @@ Os testes de unidade **não precisam de Docker nem de Ollama**: usam dublês (`F
 | `test_pipeline.py` | O investigador recebe a tarefa com evidência obrigatória, o resolvedor recebe o relatório do investigador, o modo de um modelo não muda, o reset limpa os dois |
 | `test_security_*.py` | Cada regra da auditoria dispara num exemplo ruim e fica quieta num exemplo correto; falsos positivos achados e corrigidos (chaves de tradução, `os.environ[...]`, `${VAR}`, `dockerfile.py` no Windows); códigos de saída e JSON em UTF-8 |
 | `test_commands.py` | Todos os comandos e apelidos, `/debug`, `/suggest`, `/diff`, `/explain` (sem enviar segredos), confirmações de `/apply`, `/pr`, `/discard`, `/undo` |
+| `test_eval_*.py` | O Docker simulado passando pelos wrappers e pelo monitor de verdade (a CLI real nunca é chamada), validação dos cenários (caminhos inseguros, regex inválida, campos desconhecidos), todo cenário que vem com o agente passando com a referência e reprovando quando nada é feito, notas com um `Agent` real e modelos roteirizados (correção certa, correção errada, propostas em conflito, ações negadas, erros do modelo), relatório JSON |
 | `test_cli.py`, `test_workers.py`, `test_monitor.py`, `test_docker_tools.py`, `test_tools.py`, `test_redaction.py`, `test_config.py`, `test_i18n.py`, `test_audit.py` | CLI, fila paralela, regras e `ERROR_RE`, wrapper do Docker, toolbox, ocultação (inclusive referências `${VAR}`), `.env`, traduções, auditoria |
 
 O CI roda:
 - os testes de unidade em Python 3.10 a 3.13;
 - o gitleaks em todo o histórico;
+- a auditoria de segurança deste repositório (`--fail-on high`) e a conferência dos cenários de avaliação (`eval --validate`);
 - o build da imagem Docker.
 
 ---
@@ -488,6 +542,7 @@ O `demo/docker-compose.yml` sobe quatro containers com defeitos conhecidos. Rode
 - **Comando do chat:** adicione um `Command(name, aliases, usage, help_key, handler)` em `commands.COMMANDS` e os textos nos dois catálogos.
 - **Regra de detecção:** adicione uma função pequena em `monitor.py` e inclua em `Monitor._check`.
 - **Canal de aprovação:** o `Agent` recebe um `Approver = Callable[[Tool, dict], bool]`.
+- **Cenário de avaliação:** adicione um arquivo YAML em `devops_agent/evaluation/scenarios/` (ou na sua própria pasta) e rode `devops-agent eval --validate`.
 
 ---
 
@@ -497,6 +552,8 @@ O `demo/docker-compose.yml` sobe quatro containers com defeitos conhecidos. Rode
 |---|---|
 | `llama3.2:3b` | ❌ Inventou um OOM; uma vez escreveu uma saída de `docker inspect` inteira falsa |
 | `qwen3:4b` (padrão) | ✅ Achou a porta errada do healthcheck e viu que reiniciar não resolve; numa sessão de `debug`, propôs sozinho a correção exata (`8081` → `80` no `docker-compose.yml`) numa branch própria; lento na CPU |
+
+Para comparar modelos no seu hardware, rode `devops-agent eval` com cada modelo ou par e compare as tabelas; o `--json` guarda os números.
 
 Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. Com GPU, um modelo maior (como o `qwen3:8b` em diante) dá propostas muito melhores. Para a investigação continuar rápida, combine-o com um modelo pequeno em [Dois modelos](#dois-modelos).
 
@@ -508,7 +565,7 @@ Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. 
 - **Funções pequenas e com uma responsabilidade**, e constantes em `UPPER_CASE`.
 - **Erros esperados viram valores** para o modelo (erro de ferramenta, edição recusada).
 - **Nunca usar shell:** subprocessos sempre recebem listas de argumentos.
-- **Poucas dependências:** `ollama` e `rich`.
+- **Poucas dependências:** `ollama`, `rich` e `pyyaml`.
 
 ---
 
@@ -521,6 +578,7 @@ Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. 
 - **Estado em memória:** a fila, o cooldown e os contadores de reinício vivem num único processo.
 - **Redação baseada em regex:** formatos de segredo próprios podem passar.
 - **Só Docker:** ainda não há suporte a Kubernetes.
+- **As notas da avaliação são aproximadas:** a nota de diagnóstico procura palavras-chave, então uma resposta que cita a causa com outras palavras reprova, e uma que só menciona a palavra-chave passa. A nota de correção é mais rigorosa, porque confere os arquivos. Os containers são simulados, então a correção é conferida nos arquivos, não rodando o container.
 
 ---
 
@@ -538,6 +596,7 @@ Mudanças em código exigem mais contexto e raciocínio do que um diagnóstico. 
 - [ ] Provedores de LLM: qualquer API compatível com OpenAI (vLLM, LM Studio...)
 - [x] Auditoria de segurança: Dockerfiles, compose, containers em execução, logs e segredos no repositório (`audit`, `/audit`)
 - [x] Dois modelos: um rápido investiga, um pesado resolve (`AGENT_FAST_MODEL`)
+- [x] Avaliação dos modelos: cenários simulados com bugs conhecidos, com nota de diagnóstico e correção (`eval`)
 - [ ] Estado persistente e fila distribuída
 - [ ] Vários hosts Docker, depois Kubernetes
 - [ ] `/health`, métricas Prometheus, API HTTP

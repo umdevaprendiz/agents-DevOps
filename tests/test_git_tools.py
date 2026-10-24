@@ -1,3 +1,5 @@
+import shutil
+
 import pytest
 
 from devops_agent import git_tools as gt
@@ -98,3 +100,12 @@ def test_errors_are_wrapped(git_repo):
 
 def test_has_remote(git_repo):
     assert not gt.has_remote(git_repo)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_init_and_commit_all(tmp_path):
+    write(tmp_path, "app/a.txt", "x")
+    gt.init(tmp_path, config={"user.name": "Test", "user.email": "test@example.com", "commit.gpgsign": "false"})
+    commit = gt.commit_all(tmp_path, "first")
+    assert (gt.current_branch(tmp_path), gt.head_commit(tmp_path)) == ("main", commit)
+    assert gt.tracked_files(tmp_path) == ["app/a.txt"]

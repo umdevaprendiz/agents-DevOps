@@ -49,6 +49,9 @@ jobs:
         run: pip install -e .
       - name: Audit this repository (fails on high severity)
         run: devops-agent --lang en audit --fail-on high --no-docker
+      # Each evaluation scenario must pass with its reference fix and fail when nothing is done (no model needed).
+      - name: Check the evaluation scenarios
+        run: devops-agent --lang en eval --validate
 
   docker-image:
     runs-on: ubuntu-latest

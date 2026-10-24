@@ -134,7 +134,23 @@ def test_answer_without_tools_ends_the_run(make_agent):
     (call,) = t_.client.calls
     assert call["think"] is False
     assert call["options"]["temperature"] == agent_module.TEMPERATURE
+    assert (call["options"]["num_ctx"], call["options"]["num_predict"]) == (8192, 2048)
     assert [schema["function"]["name"] for schema in call["tools"]] == ["read_thing", "change_thing", "explode", "leak"]
+
+
+def test_a_reply_cut_at_the_token_limit_is_reported(make_agent):
+    t_ = make_agent()
+
+    class LengthClient(FakeClient):
+        def chat(self, **kwargs):
+            response = super().chat(**kwargs)
+            response.done_reason = "length"
+            return response
+
+    t_.agent.client = LengthClient(assistant("**Problem:** the healthcheck the healthcheck the"))
+    assert t_.agent.run("debug web").startswith("**Problem:**")
+    assert "cut at 2048 tokens" in t_.output.getvalue()
+    assert any(record["event"] == "reply_cut" for record in audit_records(t_.audit_path))
 
 
 def test_tool_result_is_sent_back_to_the_model(make_agent):

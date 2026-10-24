@@ -1,14 +1,22 @@
 import io
+import json
+import shutil
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 from rich.prompt import InvalidResponse
 
-from devops_agent import cli, i18n
+from devops_agent import cli, i18n, ui
 from devops_agent.config import Config
+from devops_agent.evaluation import EventLog, deny_actions
+from devops_agent.evaluation.runner import ReferenceTeam, SilentTeam
 from devops_agent.monitor import Issue
+from devops_agent.proposals import ProposalStore
+from devops_agent.tools import build_toolbox
 from devops_agent.ui import YesNoConfirm
+from devops_agent.workspace import Workspace
 
 
 @pytest.fixture
@@ -282,3 +290,120 @@ def test_yes_no_confirm_shows_choices_in_the_current_language():
 def test_yes_no_confirm_rejects_other_answers():
     with pytest.raises(InvalidResponse):
         YesNoConfirm("Allow?").process_response("maybe")
+
+
+# --- Evaluation ----------------------------------------------------------------------------------------
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+@pytest.fixture
+def eval_output(monkeypatch):
+    """Captures the CLI output and the ui helpers (show_error, show_ok) in one buffer."""
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=160)
+    monkeypatch.setattr(cli, "console", console)
+    monkeypatch.setattr(ui, "console", console)
+    return buffer
+
+
+@pytest.fixture
+def eval_with(monkeypatch):
+    """Runs `eval` with a stand-in team instead of a model (no Ollama, no spinner)."""
+    monkeypatch.setattr(cli, "_check_ollama", lambda cfg: True)
+    monkeypatch.setattr(cli, "spinner", lambda message: nullcontext())
+
+    def install(make_team):
+        monkeypatch.setattr(cli, "eval_team_factory", lambda cfg, verbose: make_team)
+
+    return install
+
+
+def reference_team(scenario, tools, events, on_brief):
+    return ReferenceTeam(scenario, tools)
+
+
+def silent_team(scenario, tools, events, on_brief):
+    return SilentTeam()
+
+
+def test_eval_options():
+    args = cli.build_parser().parse_args(["eval"])
+    assert (args.scenario, args.scenarios_dir, args.repeat, args.fail_under) == (None, None, 1, None)
+    assert (args.json, args.verbose, args.list, args.validate) == (False, False, False, False)
+    args = cli.build_parser().parse_args(["eval", "--scenario", "a", "--scenario", "b", "--repeat", "3"])
+    assert (args.scenario, args.repeat) == (["a", "b"], 3)
+
+
+def test_eval_needs_neither_docker_nor_a_workspace(monkeypatch, eval_output):
+    monkeypatch.setattr(cli, "preflight", lambda cfg: pytest.fail("eval must not check Docker or the workspace"))
+    assert cli.main(["--lang", "en", "eval", "--list"]) == 0
+    assert "healthcheck-port" in eval_output.getvalue()
+
+
+def test_eval_reports_invalid_scenarios(eval_output, tmp_path):
+    assert cli.main(["--lang", "en", "eval", "--scenarios-dir", str(tmp_path)]) == 2
+    assert "No scenario files" in eval_output.getvalue()
+    assert cli.main(["--lang", "en", "eval", "--scenario", "nope", "--list"]) == 2
+    assert "Unknown scenario(s): nope" in eval_output.getvalue()
+
+
+def test_eval_stops_when_a_model_is_missing(monkeypatch, eval_output):
+    monkeypatch.setattr(cli, "_check_ollama", lambda cfg: False)
+    assert cli.main(["--lang", "en", "eval", "--scenario", "healthcheck-port"]) == 1
+
+
+@needs_git
+def test_eval_validate_needs_no_model(monkeypatch, eval_output):
+    monkeypatch.setattr(cli, "_check_ollama", lambda cfg: pytest.fail("--validate must not need Ollama"))
+    monkeypatch.setattr(cli, "spinner", lambda message: nullcontext())
+    assert cli.main(["--lang", "en", "eval", "--validate", "--scenario", "healthcheck-port"]) == 0
+    assert "1/1 scenario(s) valid." in eval_output.getvalue()
+
+
+@needs_git
+def test_eval_prints_one_line_per_run_and_a_table(eval_with, eval_output):
+    eval_with(reference_team)
+    argv = ["--lang", "en", "--model", "qwen3:4b", "eval", "--scenario", "healthcheck-port", "--scenario", "healthy-stack"]
+    assert cli.main(argv) == 0
+    text = eval_output.getvalue()
+    assert "healthcheck-port · " in text and "Evaluation · qwen3:4b · 2 scenario(s) × 1" in text
+    assert "Passed 2/2 runs (100.0%)" in text
+
+
+@needs_git
+def test_eval_json_keeps_stdout_clean(eval_with, eval_output, capsysbinary):
+    eval_with(reference_team)
+    assert cli.main(["--lang", "en", "--model", "qwen3:4b", "eval", "--scenario", "healthcheck-port", "--json"]) == 0
+    report = json.loads(capsysbinary.readouterr().out.decode("utf-8"))
+    assert report["total"]["passed"]["ok"] == 1 and report["models"]["resolver"] == "qwen3:4b"
+
+
+@needs_git
+def test_eval_fail_under(eval_with, eval_output):
+    eval_with(silent_team)
+    assert cli.main(["--lang", "en", "eval", "--scenario", "healthcheck-port", "--fail-under", "50"]) == 1
+    assert "Pass rate 0.0% is below --fail-under 50.0%." in eval_output.getvalue()
+
+
+def test_eval_team_refuses_actions_and_keeps_quiet(tmp_path):
+    cfg = Config()
+    cfg.model, cfg.fast_model = "qwen3:8b", "qwen3:4b"
+    workspace = Workspace(tmp_path)
+    tools = build_toolbox(workspace, ProposalStore(workspace))
+    briefs = []
+    team = cli.eval_team_factory(cfg, verbose=False)(SimpleNamespace(id="demo"), tools, EventLog(), briefs.append)
+
+    assert team.resolver.approver is deny_actions and team.analyst.approver is deny_actions
+    assert team.resolver.console.quiet
+    assert "propose_change" not in team.analyst.tools.names()
+    team._on_brief("report")
+    assert briefs == ["report"]
+
+
+def test_eval_stops_cleanly_on_ctrl_c(monkeypatch):
+    def interrupted(cfg, args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_eval", interrupted)
+    assert cli.main(["eval"]) == 130

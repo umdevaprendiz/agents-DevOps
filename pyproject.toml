@@ -40,6 +40,9 @@ version = { attr = "devops_agent.__version__" }
 [tool.setuptools.packages.find]
 include = ["devops_agent*"]
 
+[tool.setuptools.package-data]
+"devops_agent.evaluation" = ["scenarios/*.yml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

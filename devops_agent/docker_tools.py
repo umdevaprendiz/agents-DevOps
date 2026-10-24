@@ -3,13 +3,19 @@
 Commands always run as an argument list (never through a shell) and container names
 are validated, so the model cannot inject arbitrary commands. DOCKER_HOST and
 DOCKER_CONTEXT are honored, which lets the agent watch a remote daemon.
+
+use_backend() swaps the docker CLI for another backend in the current thread; the
+evaluation uses it to run the agent against a simulated Docker.
 """
 from __future__ import annotations
 
 import json
 import re
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
+from typing import Callable, Iterator
 
 from .i18n import t
 
@@ -22,6 +28,11 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 _SINCE_RE = re.compile(r"^\d+[smh]$")
 _TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})")
 _FALSE_WORDS = {"false", "0", "no", "nao", "não", ""}
+
+
+# Receives (args, timeout, merge_stderr) and answers like the docker CLI would.
+Backend = Callable[[list[str], int, bool], subprocess.CompletedProcess]
+_BACKEND: ContextVar[Backend | None] = ContextVar("docker_backend", default=None)
 
 
 class DockerError(Exception):
@@ -38,6 +49,21 @@ def _run(args: list[str], timeout: int = DEFAULT_TIMEOUT, merge_stderr: bool = F
 
 
 def _invoke(args: list[str], timeout: int, merge_stderr: bool) -> subprocess.CompletedProcess:
+    backend = _BACKEND.get() or _docker_cli
+    return backend(args, timeout, merge_stderr)
+
+
+@contextmanager
+def use_backend(backend: Backend) -> Iterator[None]:
+    """Answers every docker command with backend instead of the docker CLI (current thread only)."""
+    token = _BACKEND.set(backend)
+    try:
+        yield
+    finally:
+        _BACKEND.reset(token)
+
+
+def _docker_cli(args: list[str], timeout: int, merge_stderr: bool) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["docker", *args],

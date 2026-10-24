@@ -1,0 +1,80 @@
+# The report job loads 200,000 rows into a container limited to 64 MB and is killed (exit 137).
+id: oom-killed
+title:
+  en: Report job killed for lack of memory
+  pt-BR: Job de relatório morto por falta de memória
+focus: report
+
+files:
+  docker-compose.yml: |
+    services:
+      report:
+        build: ./report
+        restart: on-failure:3
+        mem_limit: 64m
+        environment:
+          BATCH_SIZE: "200000"
+  report/Dockerfile: |
+    FROM python:3.12-slim
+    WORKDIR /app
+    COPY report.py .
+    USER 10001
+    CMD ["python", "report.py"]
+  report/report.py: |
+    import os
+
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1000"))
+
+
+    def load_rows(count: int) -> list[dict]:
+        return [{"id": i, "total": i * 1.5, "customer": f"customer-{i}"} for i in range(count)]
+
+
+    def main() -> None:
+        print(f"Loading {BATCH_SIZE} rows into memory...", flush=True)
+        rows = load_rows(BATCH_SIZE)
+        print(f"Report ready: {sum(row['total'] for row in rows):.2f}", flush=True)
+
+
+    if __name__ == "__main__":
+        main()
+
+containers:
+  - name: report
+    image: shop-report:latest
+    state: exited
+    exit_code: 137
+    oom_killed: true
+    restart_count: 3
+    restart_policy: on-failure
+    memory_mb: 64
+    user: "10001"
+    command: ["python", "report.py"]
+    env: [BATCH_SIZE, PATH, PYTHON_VERSION]
+    logs: |
+      Loading 200000 rows into memory...
+      Loading 200000 rows into memory...
+      Loading 200000 rows into memory...
+      Loading 200000 rows into memory...
+
+expect:
+  diagnosis:
+    - ['re:\boom', "137", "out of memory", "sem memória", "falta de memória"]
+    - ['re:\b64\s?(m|mb|mib)\b', "mem_limit"]
+  fix:
+    # Either a higher memory limit (100 MB or more) or a much smaller batch.
+    - docker-compose.yml:
+        contains: ['re:mem_limit:\s*["'']?([1-9]\d{2,}\s*m|\d+(\.\d+)?\s*g)']
+    - docker-compose.yml:
+        contains: ['re:BATCH_SIZE:\s*["'']?([1-9]\d{0,3}|[1-4]\d{4})["'']?\s*$']
+
+reference:
+  title: Raise the report memory limit to 256m
+  answer: >-
+    report was killed by the kernel for lack of memory: exit code 137 with OOMKilled true. It loads
+    200000 rows at once, but docker-compose.yml limits it to mem_limit 64m. Raise the limit (or lower
+    BATCH_SIZE).
+  edits:
+    - path: docker-compose.yml
+      old_text: "mem_limit: 64m"
+      new_text: "mem_limit: 256m"

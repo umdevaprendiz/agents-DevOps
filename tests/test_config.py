@@ -66,7 +66,12 @@ def test_load_env_file_location_can_be_configured(tmp_path, clean_env):
 def test_empty_variables_fall_back_to_defaults(clean_env):
     clean_env.update(AGENT_MODEL="", AGENT_WORKERS="", AGENT_MAX_STEPS="  ")
     cfg = Config()
-    assert (cfg.model, cfg.workers, cfg.max_steps) == ("qwen3:4b", 2, 12)
+    assert (cfg.model, cfg.workers, cfg.max_steps, cfg.num_predict) == ("qwen3:4b", 2, 12, 2048)
+
+
+def test_reply_token_limit_is_configurable(clean_env):
+    clean_env["AGENT_NUM_PREDICT"] = "512"
+    assert Config().num_predict == 512
 
 
 def test_variables_override_defaults(clean_env):

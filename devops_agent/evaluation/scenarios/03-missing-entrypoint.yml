@@ -1,0 +1,79 @@
+# The image starts main.py, but the worker's code is in worker.py.
+id: missing-entrypoint
+title:
+  en: Worker starts a file that does not exist
+  pt-BR: Worker executa um arquivo que não existe
+focus: worker
+
+files:
+  docker-compose.yml: |
+    services:
+      worker:
+        build: ./worker
+        restart: on-failure:3
+        environment:
+          QUEUE_NAME: emails
+        mem_limit: 256m
+  worker/Dockerfile: |
+    FROM python:3.12-slim
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+    COPY . .
+    USER 10001
+    CMD ["python", "main.py"]
+  worker/requirements.txt: |
+    redis==5.2.0
+  worker/worker.py: |
+    import os
+    import time
+
+    QUEUE = os.environ.get("QUEUE_NAME", "default")
+
+
+    def main() -> None:
+        print(f"worker started, queue={QUEUE}", flush=True)
+        while True:
+            time.sleep(5)
+
+
+    if __name__ == "__main__":
+        main()
+
+containers:
+  - name: worker
+    image: shop-worker:latest
+    state: exited
+    exit_code: 2
+    restart_count: 3
+    restart_policy: on-failure
+    memory_mb: 256
+    user: "10001"
+    command: ["python", "main.py"]
+    env: [QUEUE_NAME, PATH, PYTHON_VERSION]
+    logs: |
+      python: can't open file '/app/main.py': [Errno 2] No such file or directory
+      python: can't open file '/app/main.py': [Errno 2] No such file or directory
+      python: can't open file '/app/main.py': [Errno 2] No such file or directory
+      python: can't open file '/app/main.py': [Errno 2] No such file or directory
+
+expect:
+  diagnosis:
+    - ["main.py"]
+    - ["worker.py"]
+  fix:
+    - worker/Dockerfile:
+        contains: ["worker.py"]
+        absent: ['"main.py"']
+    - docker-compose.yml:
+        contains: ['re:command:.*worker\.py']
+
+reference:
+  title: Start worker.py in the worker image
+  answer: >-
+    worker exits with code 2 because the image runs "python main.py" and /app/main.py does not exist
+    ("can't open file '/app/main.py'"). The code is in worker/worker.py, so the CMD must start worker.py.
+  edits:
+    - path: worker/Dockerfile
+      old_text: 'CMD ["python", "main.py"]'
+      new_text: 'CMD ["python", "worker.py"]'

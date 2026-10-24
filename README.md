@@ -8,6 +8,7 @@ An autonomous DevOps agent that **debugs** your containers and your project with
 - **Explains like an engineer:** every problem comes as *Problem → Error → Cause → How to fix → Proposed change*.
 - **Audits security:** 28 deterministic rules for Dockerfiles, compose, running containers, logs (brute force, attack probes) and secrets in the repository. It needs no model and works as a CI gate.
 - **Two models (optional):** a fast model investigates with read-only tools; a heavy model checks the evidence, explains the problem and writes the fix.
+- **Measurable:** `devops-agent eval` scores the models on simulated scenarios with known bugs (diagnosis, fix, invented changes), with no Docker needed.
 - **Fixes through git:** each fix is a commit on its own `agent/...` branch. Your files are untouched until you run `/apply`, or you run `/pr` to open a pull request.
 - **Private by default:** the model runs on your Ollama, so logs and code never leave your network.
 - **Safe:**
@@ -28,27 +29,28 @@ An autonomous DevOps agent that **debugs** your containers and your project with
 2. [Debugging](#debugging)
 3. [Security audit](#security-audit)
 4. [Two models](#two-models)
-5. [Chat commands](#chat-commands)
-4. [Change proposals (git flow)](#change-proposals-git-flow)
-5. [Architecture](#architecture)
-6. [Module reference](#module-reference)
-7. [Tools exposed to the model](#tools-exposed-to-the-model)
-8. [Monitor rules](#monitor-rules)
-9. [Agent loop](#agent-loop)
-10. [Parallel investigations](#parallel-investigations)
-11. [Security](#security)
-12. [Configuration](#configuration)
-13. [Languages](#languages)
-14. [Running in Docker](#running-in-docker)
-15. [Audit log](#audit-log)
-16. [Testing](#testing)
-17. [Demo environment](#demo-environment)
-18. [Extending](#extending)
-19. [Choosing a model](#choosing-a-model)
-20. [Code conventions](#code-conventions)
-21. [Known limitations](#known-limitations)
-22. [Roadmap](#roadmap)
-23. [Contributing](#contributing)
+5. [Model evaluation](#model-evaluation)
+6. [Chat commands](#chat-commands)
+7. [Change proposals (git flow)](#change-proposals-git-flow)
+8. [Architecture](#architecture)
+9. [Module reference](#module-reference)
+10. [Tools exposed to the model](#tools-exposed-to-the-model)
+11. [Monitor rules](#monitor-rules)
+12. [Agent loop](#agent-loop)
+13. [Parallel investigations](#parallel-investigations)
+14. [Security](#security)
+15. [Configuration](#configuration)
+16. [Languages](#languages)
+17. [Running in Docker](#running-in-docker)
+18. [Audit log](#audit-log)
+19. [Testing](#testing)
+20. [Demo environment](#demo-environment)
+21. [Extending](#extending)
+22. [Choosing a model](#choosing-a-model)
+23. [Code conventions](#code-conventions)
+24. [Known limitations](#known-limitations)
+25. [Roadmap](#roadmap)
+26. [Contributing](#contributing)
 
 ---
 
@@ -74,6 +76,7 @@ devops-agent debug                 # find what fails, explain it and propose fix
 devops-agent debug api timeout     # same, focused on a container, file or symptom
 devops-agent chat                  # interactive: /debug, /diff, /explain, /apply, /pr...
 devops-agent watch --scan-logs     # keep watching containers and investigate incidents
+devops-agent eval                  # score your model on simulated bugs (no Docker needed)
 ```
 
 ---
@@ -161,6 +164,52 @@ flowchart LR
 
 ---
 
+## Model evaluation
+
+`devops-agent eval` measures how well a model, or a pair of models, debugs. It runs the agent on scenarios with known bugs, exactly as `/debug` would, and scores what it did.
+
+```bash
+devops-agent eval                                    # every built-in scenario, with AGENT_MODEL
+devops-agent --model qwen3:8b --fast-model qwen3:1.7b eval --repeat 3
+devops-agent eval --scenario oom-killed --verbose    # one scenario, showing every step
+devops-agent eval --json > results.json              # machine-readable, to compare models
+devops-agent eval --validate                         # checks the scenarios themselves (no model)
+```
+
+- **No Docker and no project needed:** each scenario gets a temporary git repository with its files and a **simulated Docker** with its containers. The simulation answers the same `docker` commands as the real daemon (`ps`, `inspect`, `logs`, `stats`), so the monitor, the diagnostics, the security audit and every tool run unchanged. Your containers and files are never touched.
+- **The same flow as `/debug`:** same prompt, same tools and same two-model team. Container actions are always denied, and counted.
+- **Light on memory:** scenarios run one after the other.
+
+| Scenario | Bug | Scored |
+|---|---|---|
+| `healthcheck-port` | The healthcheck calls port 8081, but nginx listens on 80 | Diagnosis, fix |
+| `missing-env` | The api exits because `DATABASE_URL` is never passed to it | Diagnosis, fix |
+| `missing-entrypoint` | The image starts `main.py`, but the code is in `worker.py` | Diagnosis, fix |
+| `oom-killed` | Exit code 137: 200,000 rows loaded in a 64 MB container | Diagnosis, fix |
+| `healthy-stack` | None (control scenario) | Proposes nothing |
+
+| Score | How it is measured |
+|---|---|
+| **Diagnosis** | The answer, or a proposal's title and explanation, names the cause. It looks for technical keywords that work in both languages, such as `8081` or `DATABASE_URL` |
+| **Fix** | The proposals are merged into a copy, in the order they were created, and the resulting files are checked (e.g. the healthcheck points to port 80 and `8081` is gone). Any valid fix counts: in `oom-killed`, a higher limit or a smaller batch |
+| **No changes** | In the healthy scenario any proposal fails, which measures how often the model invents fixes |
+| **Analyst** | Two-model mode only: whether the fast model's report already named the cause |
+| Tools, denied, time | Average tool calls, container actions attempted and seconds per run |
+
+- **Pass or fail:** a run passes when every scored check passes.
+- **Consistency:** `--repeat N` shows how consistent the model is (e.g. `2/3`).
+- **CI gate:** `--fail-under 80` turns the pass rate into an exit code.
+
+**Your own scenarios:** `eval --scenarios-dir my-scenarios/` loads YAML files in the same format as [the built-in ones](devops_agent/evaluation/scenarios/):
+- `files`: the project;
+- `containers`: state, exit code, OOM, health, logs...;
+- `expect`: `diagnosis` groups, `fix` options with `contains`/`absent`, or `no_changes`. Patterns that start with `re:` are regular expressions;
+- `reference`: the solution a perfect agent would give.
+
+`eval --validate` checks that each scenario passes with its reference and fails when the agent does nothing. CI runs it on every push.
+
+---
+
 ## Chat commands
 
 `devops-agent chat` works like a coding assistant: you talk to the agent and use slash commands. Every command has an English name and a Portuguese alias.
@@ -236,7 +285,7 @@ flowchart LR
 
 ```
 devops_agent/
-  cli.py           argument parsing, preflight, commands (chat, ask, debug, check, watch)
+  cli.py           argument parsing, preflight, commands (chat, ask, debug, audit, eval, check, watch)
   commands.py      chat loop and slash commands; debug() and suggest() sessions
   agent.py         Agent: model → tool → result loop (role: resolver or analyst)
   pipeline.py      Team: fast model investigates, heavy model resolves
@@ -245,6 +294,7 @@ devops_agent/
   workspace.py     confined, read-only access to the project files
   diagnostics.py   deterministic health report (containers, log files, infra files)
   security/        security audit: dockerfile, compose, runtime, logs, secrets, heuristics, audit
+  evaluation/      model evaluation: scenarios (YAML), simulated Docker, runner, scores and report
   git_tools.py     git CLI wrapper, including plumbing commits
   proposals.py     change proposals: create, diff, apply, pull request, discard, undo
   monitor.py       Issue, Monitor and detection rules
@@ -271,6 +321,7 @@ demo/              containers broken on purpose
 | `commands.py` | **`Session`** (`agent` for chat, `team` for investigative commands), **`Command`**, `COMMANDS`, `dispatch`, `handle_input`, `run_chat`, `debug`, `suggest`, `security_review`, `ask_agent`. |
 | `pipeline.py` | **`Team`**: `run(task)` sends the task to the analyst (fast model) when there is one, then hands its report to the resolver (heavy model); `reset()` clears both. **`Runner`** protocol (`run`, `reset`), shared by `Agent` and `Team`. |
 | `tools.py` | **`Tool`**, **`Toolbox`**, `DOCKER_TOOLS`, `workspace_tools`, `diagnostics_tool`, `proposal_tool`, `build_toolbox`. |
+| `evaluation/` | **`Scenario`** (`load_scenarios`, `select`, `parse`); **`SimulatedDocker`** (answers `ps`, `inspect`, `logs`, `stats`; installed with `docker_tools.use_backend`, per thread); **`Environment`** (temporary git repository + simulated Docker); `evaluate` and `run_scenario` (the `/debug` task, scored); **`RunResult`**, `summarize`, `as_json`; `validate` (reference solution against doing nothing). |
 | `agent.py` | **`Agent`**: `run(task, require_evidence)` plus small private steps (`_step`, `_execute`, `_approve`, `_invoke`...). It receives a `Toolbox`. |
 | `monitor.py`, `workers.py`, `redaction.py`, `audit.py`, `config.py`, `i18n.py`, `ui.py`, `docker_tools.py` | Unchanged responsibilities: rules, the parallel queue, masking, audit, settings, translations, terminal and the Docker CLI. |
 
@@ -319,7 +370,7 @@ Every rule that fires for a container is merged into one `Issue`.
 ## Agent loop
 
 1. **Start:** appends the task, trims old history and audits `task`.
-2. **Round:** calls `chat` with the toolbox, `temperature=0.1`, `num_ctx` and `think=False`, then strips any reasoning, including qwen3's reasoning that ends in a lone `</think>`.
+2. **Round:** calls `chat` with the toolbox, `temperature=0.1`, `num_ctx`, `num_predict` and `think=False`, then strips any reasoning, including qwen3's reasoning that ends in a lone `</think>`.
 3. **Tool calls:** native `tool_calls`; if there are none, it looks for a JSON call written in the text and accepts only known tool names.
 4. **Execution:**
    - An unknown tool returns the list of valid ones.
@@ -372,6 +423,7 @@ Environment variables or a `.env` file (copy `.env.example`, which holds **names
 | `AGENT_WORKERS` | `2` | Parallel investigations |
 | `AGENT_MAX_STEPS` | `12` | Max model → tool rounds per task |
 | `AGENT_NUM_CTX` | `8192` | Context window requested from Ollama |
+| `AGENT_NUM_PREDICT` | `2048` | Most tokens per model reply. A small model stuck in a loop is cut here instead of holding the session for many minutes |
 | `AGENT_MAX_TOOL_OUTPUT` | `4000` | Max characters of each tool output |
 | `AGENT_AUDIT_FILE` | `logs/audit.jsonl` | Audit log path |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server |
@@ -459,11 +511,13 @@ Unit tests need **neither Docker nor Ollama**: they use test doubles (`FakeClien
 | `test_pipeline.py` | The analyst receives the task with evidence required, the resolver receives the analyst's report, single-model mode is unchanged, reset clears both |
 | `test_security_*.py` | Every audit rule fires on a bad example and stays quiet on a hardened one; false positives that were found and fixed (translation keys, `os.environ[...]`, `${VAR}`, `dockerfile.py` on Windows); exit codes and UTF-8 JSON |
 | `test_commands.py` | Every command and alias, `/debug`, `/suggest`, `/diff`, `/explain` (no secrets sent), confirmations for `/apply`, `/pr`, `/discard`, `/undo` |
+| `test_eval_*.py` | The simulated Docker through the real wrappers and monitor (the real CLI is never called), scenario validation (unsafe paths, bad regex, unknown fields), every built-in scenario passing with its reference and failing when nothing is done, scoring with a real `Agent` and scripted models (right fix, wrong fix, conflicting proposals, denied actions, model errors), JSON report |
 | `test_cli.py`, `test_workers.py`, `test_monitor.py`, `test_docker_tools.py`, `test_tools.py`, `test_redaction.py`, `test_config.py`, `test_i18n.py`, `test_audit.py` | CLI, parallel queue, rules and `ERROR_RE`, Docker wrapper, toolbox, masking (including `${VAR}` references), `.env`, translations, audit |
 
 CI runs:
 - the unit tests on Python 3.10 to 3.13;
 - gitleaks over the whole history;
+- the security audit of this repository (`--fail-on high`) and the check of the evaluation scenarios (`eval --validate`);
 - a Docker image build.
 
 ---
@@ -487,6 +541,7 @@ CI runs:
 - **A chat command:** add a `Command(name, aliases, usage, help_key, handler)` to `commands.COMMANDS` and its texts to both catalogs.
 - **A detection rule:** add a small function to `monitor.py` and include it in `Monitor._check`.
 - **An approval channel:** `Agent` receives an `Approver = Callable[[Tool, dict], bool]`.
+- **An evaluation scenario:** add a YAML file to `devops_agent/evaluation/scenarios/` (or to your own folder) and run `devops-agent eval --validate`.
 
 ---
 
@@ -496,6 +551,8 @@ CI runs:
 |---|---|
 | `llama3.2:3b` | ❌ Invented an OOM kill; once it fabricated a whole `docker inspect` output |
 | `qwen3:4b` (default) | ✅ Found the wrong healthcheck port and that restarting won't help; in a `debug` session it proposed the exact fix (`8081` → `80` in `docker-compose.yml`) on its own branch; slow on a CPU |
+
+To compare models on your own hardware, run `devops-agent eval` with each model or pair and compare the tables; `--json` keeps the numbers.
 
 Code changes need more context and reasoning than diagnosis. With a GPU, a larger model (such as `qwen3:8b` and up) gives much better proposals. To keep the investigation fast, pair it with a small model through [Two models](#two-models).
 
@@ -507,7 +564,7 @@ Code changes need more context and reasoning than diagnosis. With a GPU, a large
 - **Small, single-purpose functions** and `UPPER_CASE` constants.
 - **Expected errors become values** for the model (tool errors, refused edits).
 - **No shell, ever:** subprocesses always receive argument lists.
-- **Few dependencies:** `ollama` and `rich`.
+- **Few dependencies:** `ollama`, `rich` and `pyyaml`.
 
 ---
 
@@ -520,6 +577,7 @@ Code changes need more context and reasoning than diagnosis. With a GPU, a large
 - **In-memory state:** the queue, cooldown and restart counters live in one process.
 - **Redaction is regex-based:** custom secret formats may get through.
 - **Docker only:** there is no Kubernetes support yet.
+- **Evaluation scores are approximate:** the diagnosis score looks for keywords, so an answer that names the cause in other words fails, and one that only mentions the keyword passes. The fix score is stricter because it checks the files. The containers are simulated, so a fix is checked in the files, not by running it.
 
 ---
 
@@ -537,6 +595,7 @@ Code changes need more context and reasoning than diagnosis. With a GPU, a large
 - [ ] LLM providers: any OpenAI-compatible API (vLLM, LM Studio...)
 - [x] Security audit: Dockerfiles, compose, running containers, logs and repository secrets (`audit`, `/audit`)
 - [x] Two models: a fast one investigates, a heavy one resolves (`AGENT_FAST_MODEL`)
+- [x] Model evaluation: simulated scenarios with known bugs, scored diagnosis and fix (`eval`)
 - [ ] Persistent state and a distributed queue
 - [ ] Multiple Docker hosts, then Kubernetes
 - [ ] `/health`, Prometheus metrics, HTTP API
