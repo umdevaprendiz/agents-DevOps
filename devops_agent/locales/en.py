@@ -336,7 +336,7 @@ Answer in English with this report, short and factual:
     "cli.help.scenario": "run only this scenario (repeatable; see --list)",
     "cli.help.scenarios_dir": "folder with your own scenario files (*.yml) instead of the built-in ones",
     "cli.help.repeat": "runs per scenario, to measure how consistent the model is (default 1)",
-    "cli.help.fail_under_rate": "exit with code 1 when the pass rate (%) is below this value",
+    "cli.help.fail_under_rate": "exit with code 1 when the pass rate is below this percentage",
     "cli.help.eval_json": "print the results as JSON",
     "cli.help.verbose": "show every step of the agent",
     "cli.help.list": "list the scenarios and exit",

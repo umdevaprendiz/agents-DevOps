@@ -5,7 +5,7 @@ import argparse
 import shutil
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from typing import Iterator
 
@@ -281,7 +281,12 @@ def _eval_progress(total: int, repeat: int):
 
     def progress(scenario: evaluation.Scenario, attempt: int):
         index = order.setdefault(scenario.id, len(order) + 1)
-        return spinner(evaluation.run_label(scenario, attempt, repeat, index, total))
+        label = evaluation.run_label(scenario, attempt, repeat, index, total)
+        if console.is_terminal:
+            return spinner(label)
+        # Output redirected to a file: a spinner draws nothing there, so each run gets a plain line.
+        show_dim(label)
+        return nullcontext()
 
     return progress
 

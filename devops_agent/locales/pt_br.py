@@ -337,7 +337,7 @@ Responda em português com este relatório, curto e factual:
     "cli.help.scenario": "roda só este cenário (pode repetir; veja --list)",
     "cli.help.scenarios_dir": "pasta com seus próprios cenários (*.yml) no lugar dos que vêm com o agente",
     "cli.help.repeat": "execuções por cenário, para medir a consistência do modelo (padrão 1)",
-    "cli.help.fail_under_rate": "sai com código 1 quando a taxa de acerto (%) fica abaixo deste valor",
+    "cli.help.fail_under_rate": "sai com código 1 quando a taxa de acerto fica abaixo desta porcentagem",
     "cli.help.eval_json": "imprime os resultados em JSON",
     "cli.help.verbose": "mostra cada passo do agente",
     "cli.help.list": "lista os cenários e sai",

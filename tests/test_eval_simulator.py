@@ -1,14 +1,11 @@
 """The simulated Docker answers the real docker_tools code: no Docker daemon needed."""
 import threading
-from datetime import datetime, timezone
 
 import pytest
 
 from devops_agent import docker_tools as dk
 from devops_agent.evaluation.simulator import ContainerSpec, SimulatedDocker, SimulationError
 from devops_agent.monitor import Monitor
-
-NOW = datetime(2026, 10, 23, 18, 0, tzinfo=timezone.utc)
 
 
 def spec(**overrides) -> ContainerSpec:
@@ -24,7 +21,7 @@ def docker(monkeypatch):
     monkeypatch.setattr(dk, "_docker_cli", no_cli)
 
     def install(*specs: ContainerSpec) -> SimulatedDocker:
-        simulated = SimulatedDocker(list(specs), now=NOW)
+        simulated = SimulatedDocker(list(specs))
         context = dk.use_backend(simulated)
         context.__enter__()
         installed.append(context)
@@ -119,7 +116,7 @@ def test_the_monitor_finds_the_simulated_problems(docker):
 
 def test_backend_is_restored_and_local_to_the_thread(docker):
     seen = []
-    with dk.use_backend(SimulatedDocker([spec()], now=NOW)):
+    with dk.use_backend(SimulatedDocker([spec()])):
         assert dk._BACKEND.get() is not None
         worker = threading.Thread(target=lambda: seen.append(dk._BACKEND.get()))
         worker.start()

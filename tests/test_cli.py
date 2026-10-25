@@ -1,3 +1,4 @@
+import argparse
 import io
 import json
 import shutil
@@ -89,6 +90,16 @@ def test_overrides_from_arguments():
 def test_command_is_required():
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args([])
+
+
+@pytest.mark.parametrize("language", ["en", "pt-BR"])
+def test_every_help_page_renders(language):
+    # argparse reads % in help texts as a format marker, so a bare one breaks --help.
+    i18n.set_language(language)
+    parser = cli.build_parser()
+    commands = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+    for page in [parser, *commands.choices.values()]:
+        assert page.format_help()
 
 
 def test_check_monitor_uses_wider_log_window():
@@ -407,3 +418,12 @@ def test_eval_stops_cleanly_on_ctrl_c(monkeypatch):
 
     monkeypatch.setattr(cli, "run_eval", interrupted)
     assert cli.main(["eval"]) == 130
+
+
+def test_eval_progress_prints_a_line_when_the_output_is_not_a_terminal(eval_output):
+    from devops_agent.evaluation import load_scenarios
+
+    scenario = load_scenarios()[0]
+    with cli._eval_progress(total=5, repeat=1)(scenario, 1):
+        pass
+    assert f"[1/5] {scenario.id} · attempt 1/1" in eval_output.getvalue()
